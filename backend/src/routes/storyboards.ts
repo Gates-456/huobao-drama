@@ -94,7 +94,7 @@ app.post('/', async (c) => {
     title: body.title,
     description: body.description,
     sceneId: body.scene_id,
-    duration: body.duration || 10,
+    duration: body.duration || 5,
     createdAt: ts,
     updatedAt: ts,
   })

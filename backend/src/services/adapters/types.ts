@@ -111,6 +111,9 @@ export interface VideoGenerationRecord {
   seed?: number | null
   promptExtend?: number | boolean | null
   watermark?: number | boolean | null
+  /** 参考图身份标签（ComfyUI H3 Ref2VA 用）：参考图 URL/文件名 -> 图中主体名（角色名或场景名）。
+   *  adapter 据此过滤提示词未提及的角色图，并生成 <Picture N> 身份绑定句，防止多角色镜串脸。 */
+  referenceImageLabels?: Record<string, string> | null
   // ... 其他字段
 }
 

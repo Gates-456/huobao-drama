@@ -812,7 +812,7 @@
                       <span class="video-param-name">{{ t('episode.inspector.duration') }}</span>
                       <span class="video-param-control">
                         <input
-                          :value="selectedSb.duration || 10"
+                          :value="selectedSb.duration || 5"
                           type="number"
                           min="2"
                           max="30"
@@ -1994,6 +1994,8 @@ function videoErrorLabel(id, error) {
   const task = latestVideoTask(id)
   if (task?.error_code === 'delivery_failed' || (task?.result_url && task?.status === 'failed')) return t('episode.recovery.downloadFailed')
   if (task?.error_code === 'submission_unknown') return t('episode.recovery.unknownSubmission')
+  // 轮询窗口耗尽是误报：上游队列大概率还在跑，提示等待/刷新而非"请重试"
+  if (task?.error_code === 'polling_timeout') return t('episode.recovery.pollingTimeout')
   return mapError(error)
 }
 async function copyVideoDiagnostics(id) {
@@ -2209,7 +2211,7 @@ const episodeResolutionLabel = computed(() =>
 // 短档位标签（480p / 768P / 2K 等厂商原生档位），用于底部生效配置小结
 const episodeResolutionShort = computed(() =>
   RESOLUTION_DISPLAY[resolutionProvider.value][episodeResolution.value] || episodeResolution.value)
-const effectiveVideoDuration = computed(() => Number(selectedSb.value?.duration || 10))
+const effectiveVideoDuration = computed(() => Number(selectedSb.value?.duration || 5))
 const batchVideoTotalDuration = computed(() =>
   batchVideoConfirm.value.targets.reduce((sum, sb) => sum + (Number(sb.duration) || 5), 0))
 
@@ -2298,6 +2300,13 @@ async function loadGenTasks() {
     for (const id of pendingVideoIds.value) if (!latestBySb.has(id)) pending.add(id)
     for (const id of Object.keys(failedVideoMessages.value)) {
       if (!latestBySb.has(Number(id))) failed[id] = failedVideoMessages.value[id]
+    }
+    // 轮询窗口耗尽是误报(上游队列大概率还在跑):回到 pending 继续跟踪,错误文案改为等待提示
+    for (const [sbId, t] of latestBySb) {
+      if (t.status === 'failed' && t.error_code === 'polling_timeout' && !hasVid(sbs.value.find(s => s.id === sbId))) {
+        pending.add(sbId)
+        failed[sbId] = t('episode.recovery.pollingTimeout')
+      }
     }
     pendingVideoIds.value = [...pending]
     failedVideoMessages.value = failed
@@ -2597,7 +2606,7 @@ const currentMainStageLabel = computed(() => {
 
 const currentSubStageLabel = computed(() => currentStageLabel.value)
 
-const totalDuration = computed(() => sbs.value.reduce((s, sb) => s + (sb.duration || 10), 0))
+const totalDuration = computed(() => sbs.value.reduce((s, sb) => s + (sb.duration || 5), 0))
 const selectedSb = ref(null)
 const selectedVideoTaskNumber = computed(() => {
   const index = videoTaskRows.value.findIndex(task => String(task.id) === String(selectedSb.value?.id))
@@ -2904,11 +2913,11 @@ async function genVideoPrompt(sb) {
   videoPromptGeneratingIds.value.push(sb.id)
   try {
     await api.post(`/agent/prompt_generator/chat`, {
-      message: `请为分镜 #${idx}(ID:${sb.id})生成视频提示词(video_prompt)。视频模型:${label},请根据该模型的特性和时长限制生成。
+      message: `请为分镜 #${idx}(ID:${sb.id})生成视频提示词(video_prompt)。视频模型:${label};本地 MiniMax-H3 管线固定 5 秒/镜,请按 5 秒单段格式生成。
 
-该分镜信息:时长 ${sb.duration || 10}s;场景:${getSceneName(sb) || '未绑定'};角色:${charNames};道具:${propNames}。
+该分镜信息:时长 ${sb.duration || 5}s;场景:${getSceneName(sb) || '未绑定'};角色:${charNames};道具:${propNames}。
 
-请先调用 read_storyboard_context 获取该分镜的画面描述(含【镜头N】子镜头与台词/旁白)、氛围及时长,据此生成 video_prompt(按 3 秒分段换行、用 @角色名/@场景名/@道具名 引用参考素材；段落内允许多镜头切镜,但不跨场景,切镜点对齐 description 的【镜头N】结构),然后调用 update_storyboard 保存到分镜 ID:${sb.id}。只更新 video_prompt 字段,不要改动其他字段,不要重新拆分整集。`,
+请先调用 read_storyboard_context 获取该分镜的画面描述(含台词/旁白)、氛围及时长,据此生成 video_prompt(整条提示词只有一行、以「0-5秒:」开头——先写景别/角度+谁做什么动作+表情细节,再接该镜台词/旁白;说话主体必须明确唯一,谁做动作、谁说台词写清楚;不要按 3 秒分段、不要写多个子段;台词/旁白从 description 的「角色名说:「…」」「旁白:…」提取,不要创作 description 之外的新台词;用 @角色名/@场景名/@道具名 引用参考素材,名字与列表完全一致;氛围光线取自 atmosphere,简短带过),然后调用 update_storyboard 保存到分镜 ID:${sb.id}。只更新 video_prompt 字段,不要改动其他字段,不要重新拆分整集。`,
       drama_id: dramaId,
       episode_id: epId.value,
       model: chatModelOverride() || undefined,
@@ -3302,7 +3311,7 @@ function onVideoDurationChange(e) {
   const min = 2
   const max = 30
   let v = Math.round(Number(e.target.value))
-  if (!Number.isFinite(v)) v = Number(sb.duration || 10)
+  if (!Number.isFinite(v)) v = Number(sb.duration || 5)
   v = Math.min(max, Math.max(min, v))
   e.target.value = v
   updateField(sb, 'duration', v)
@@ -3357,7 +3366,7 @@ async function genVid(sb, opts = {}) {
     storyboard_id: sb.id,
     drama_id: dramaId,
     prompt: resolveVideoPromptRefs(sb),
-    duration: Number(sb.duration || 10),
+    duration: Number(sb.duration || 5),
     aspect_ratio: dramaAspectRatio.value,
     generate_audio: true,
     model: bareModelName(videoModel.value) || undefined,

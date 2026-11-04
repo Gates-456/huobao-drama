@@ -30,7 +30,10 @@ const taskLabel = (type: TaskType) => (type === 'image' ? 'ImageTask' : 'VideoTa
 // 轮询节奏：图片 5s×120（上限 10 分钟）；视频 10s×300
 const POLL_PROFILES: Record<TaskType, { attempts: number; intervalMs: number; maxDurationMs: number | null }> = {
   image: { attempts: 120, intervalMs: 5000, maxDurationMs: 600_000 },
-  video: { attempts: 300, intervalMs: 10_000, maxDurationMs: null },
+  // video: 串行批量时排队时间不可控（19 镜实测 ~21.5h，单镜 25-40 分钟且有他人任务插队）。
+  // 900 次（2.5h）必然中途耗尽并误报 failed（页面显示"生成超时，请重试"）。
+  // 4320 次 × 10s = 12h，覆盖一整批 19 镜的排队+生成；再长靠 resumeInterruptedTasks / recover。
+  video: { attempts: 4320, intervalMs: 10_000, maxDurationMs: null },
 }
 
 interface GenerateImageParams {
@@ -213,6 +216,46 @@ function parseTaskParams(raw: string | null | undefined): Record<string, any> {
   }
 }
 
+/**
+ * 构建参考图身份标签（仅 ComfyUI H3 Ref2VA 路径需要）：
+ * 参考图 URL -> 图中主体名（角色名/场景名）。
+ * 来源：storyboard 的 scene 场景图 + storyboard_characters 角色图。
+ * resolvedRefs 为 normalizeVideoReferenceUrls 输出（dataURL 或原 URL），按原始顺序与
+ * DB 图片路径对齐（normalizeVideoReferenceUrls 去重不改变首次出现顺序），因此可按下标对应。
+ * adapter 据此剔除提示词未提及的角色参考图，并生成 <Picture N> 身份绑定句，
+ * 修复双角色镜中「主角先验压倒文本」导致的串脸/串词问题。
+ */
+async function buildReferenceImageLabels(
+  storyboardId: number | null | undefined,
+  resolvedRefs: string[],
+): Promise<Record<string, string>> {
+  if (!storyboardId || !resolvedRefs.length) return {}
+  const labels: Record<string, string> = {}
+  try {
+    const [sb] = await db.select({ sceneId: schema.storyboards.sceneId }).from(schema.storyboards).where(eq(schema.storyboards.id, storyboardId))
+    const rows = await db.select({ name: schema.characters.name, imageUrl: schema.characters.imageUrl })
+      .from(schema.storyboardCharacters)
+      .innerJoin(schema.characters, eq(schema.characters.id, schema.storyboardCharacters.characterId))
+      .where(eq(schema.storyboardCharacters.storyboardId, storyboardId))
+    // 提交侧参考图顺序约定：场景图在前、角色图在后（前端/批量脚本均按此顺序组装）；
+    // 对齐后 labels 以 resolvedRefs 的实际值（dataURL）为键
+    let idx = 0
+    if (sb?.sceneId) {
+      const [scene] = await db.select({ location: schema.scenes.location, imageUrl: schema.scenes.imageUrl })
+        .from(schema.scenes).where(eq(schema.scenes.id, sb.sceneId))
+      if (scene?.imageUrl && resolvedRefs[0] != null) { labels[resolvedRefs[0]] = `场景 ${scene.location}`; idx = 1 }
+    }
+    for (const row of rows) {
+      if (!row.imageUrl || idx >= resolvedRefs.length) continue
+      labels[resolvedRefs[idx]] = row.name
+      idx += 1
+    }
+  } catch (err) {
+    logTaskWarn('VideoTask', 'reference-labels-failed', { storyboardId, error: (err as Error).message })
+  }
+  return labels
+}
+
 async function processTask(id: number, config: AIConfig) {
   try {
     const [record] = await db.select().from(schema.sysTask).where(eq(schema.sysTask.id, id))
@@ -251,6 +294,7 @@ async function processTask(id: number, config: AIConfig) {
       const resolvedReferenceVideoUrls = resolvePublicMediaUrls(params.referenceVideoUrls, 'video')
       const resolvedReferenceAudioUrls = resolvePublicMediaUrls(params.referenceAudioUrls, 'audio')
       const resolvedReferenceFileUrl = resolvePublicMediaUrl(params.referenceFileUrl, 'file')
+      const referenceImageLabels = await buildReferenceImageLabels(record.storyboardId, resolvedReferenceImageUrls)
       ;({ url, method, headers, body } = adapter.buildGenerateRequest(config, {
         id: record.id,
         model: record.model,
@@ -260,6 +304,7 @@ async function processTask(id: number, config: AIConfig) {
         firstFrameUrl: resolvedFirstFrameUrl,
         lastFrameUrl: resolvedLastFrameUrl,
         referenceImageUrls: resolvedReferenceImageUrls.length ? JSON.stringify(resolvedReferenceImageUrls) : null,
+        referenceImageLabels,
         referenceVideoUrls: resolvedReferenceVideoUrls.length ? JSON.stringify(resolvedReferenceVideoUrls) : null,
         referenceAudioUrls: resolvedReferenceAudioUrls.length ? JSON.stringify(resolvedReferenceAudioUrls) : null,
         referenceFileUrl: resolvedReferenceFileUrl,
@@ -288,6 +333,22 @@ async function processTask(id: number, config: AIConfig) {
       // multipart 表单（如 OpenAI /v1/images/edits）无法 JSON 化，记录字段摘要
       body: isMultipart ? `[multipart/form-data: ${[...(body as FormData).keys()].join(', ')}]` : body,
     })
+
+    // ComfyUI adapter：dataURL 图片（首帧+参考图）需先上传到 /upload/image，再从 body 中移除上传负载
+    if (type === 'video' && !isMultipart && Array.isArray((body as any)?.__huobao_uploads)) {
+      const uploads = (body as any).__huobao_uploads
+      delete (body as any).__huobao_uploads
+      for (const up of uploads) {
+        const blob = Buffer.from(up.base64, 'base64')
+        const form = new FormData()
+        form.append('image', new Blob([blob], { type: 'image/png' }), up.filename)
+        form.append('overwrite', 'true')
+        const uploadUrl = new URL('/upload/image', url).toString()
+        const uploadResp = await fetch(uploadUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(120_000) })
+        if (!uploadResp.ok) throw new Error(`ComfyUI 图片上传失败(${up.filename}) ${uploadResp.status}: ${await uploadResp.text()}`)
+        logTaskProgress(label, 'comfyui-image-uploaded', { id, filename: up.filename, field: up.field })
+      }
+    }
 
     const resp = await fetch(url, {
       method,
@@ -446,13 +507,14 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
       const exhausted = i === profile.attempts - 1
         || (profile.maxDurationMs != null && Date.now() - startedAt >= profile.maxDurationMs)
       if (exhausted) {
-        await failTask(record.id, `Timeout: ${err.message}`)
+        // 轮询窗口耗尽≠生成失败：上游队列通常还在跑，打 polling_timeout 码便于恢复与前端区分
+        await failTask(record.id, `Timeout: ${err.message}`, 'polling_timeout')
         return
       }
       logTaskWarn(label, 'poll-retry', { id: record.id, taskId, attempt: i + 1, error: err.message })
     }
   }
-  await failTask(record.id, 'Timeout: polling attempts exhausted')
+  await failTask(record.id, 'Timeout: polling attempts exhausted', 'polling_timeout')
 }
 
 async function handleImageComplete(record: SysTaskRecord, imageUrl: string) {
