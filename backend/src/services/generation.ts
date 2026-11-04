@@ -28,10 +28,12 @@ function runBackground(id: number, job: () => Promise<void>) {
 
 const taskLabel = (type: TaskType) => (type === 'image' ? 'ImageTask' : 'VideoTask')
 
-// 轮询节奏：图片 5s×120（上限 10 分钟）；视频 10s×300
+// 轮询节奏：图片 5s×120（上限 10 分钟）；视频 10s×4320
 const POLL_PROFILES: Record<TaskType, { attempts: number; intervalMs: number; maxDurationMs: number | null }> = {
   image: { attempts: 120, intervalMs: 5000, maxDurationMs: 600_000 },
-  video: { attempts: 300, intervalMs: 10_000, maxDurationMs: null },
+  // video: 串行批量时排队时间不可控（19 镜实测 ~21.5h，单镜 25-40 分钟且有他人任务插队）。
+  // 300 次（50 分钟）必然中途耗尽并误报 failed；4320 次 × 10s = 12h，再长靠 recover。
+  video: { attempts: 4320, intervalMs: 10_000, maxDurationMs: null },
 }
 
 interface GenerateImageParams {
@@ -291,6 +293,22 @@ async function processTask(id: number, config: AIConfig) {
       // multipart 表单（如 OpenAI /v1/images/edits）无法 JSON 化，记录字段摘要
       body: isMultipart ? `[multipart/form-data: ${[...(body as FormData).keys()].join(', ')}]` : body,
     })
+
+    // ComfyUI adapter：dataURL 图片（首帧+参考图）需先上传到 /upload/image，再从 body 中移除上传负载
+    if (type === 'video' && !isMultipart && Array.isArray((body as any)?.__huobao_uploads)) {
+      const uploads = (body as any).__huobao_uploads
+      delete (body as any).__huobao_uploads
+      for (const up of uploads) {
+        const blob = Buffer.from(up.base64, 'base64')
+        const form = new FormData()
+        form.append('image', new Blob([blob], { type: 'image/png' }), up.filename)
+        form.append('overwrite', 'true')
+        const uploadUrl = new URL('/upload/image', url).toString()
+        const uploadResp = await fetch(uploadUrl, { method: 'POST', body: form, signal: AbortSignal.timeout(120_000) })
+        if (!uploadResp.ok) throw new Error(`ComfyUI 图片上传失败(${up.filename}) ${uploadResp.status}: ${await uploadResp.text()}`)
+        logTaskProgress(label, 'comfyui-image-uploaded', { id, filename: up.filename, field: up.field })
+      }
+    }
 
     const resp = await fetch(url, {
       method,
