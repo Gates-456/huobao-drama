@@ -50,18 +50,42 @@ export function stripQuoteMarks(prompt: string): string {
   return prompt.replace(QUOTE_CHARS, '')
 }
 
-/** 「说：」「道：」等冒号引导统一归一为逗号（防冒号+文本块触发字幕渲染） */
+/** 「说：」「道：」等冒号引导统一转成官方 <d> 对话通道（引号与冒号+文本块都会触发字幕渲染） */
 export function normalizeDialogueColon(prompt: string): string {
   return prompt
-    .replace(/(说|道|喊|问|答|念|嘀咕|低语|嘶吼|呐喊|冷笑道|苦笑道|自嘲道)：/g, '$1，')
-    .replace(/(says?|said|shouts?|asks?|replies?)\s*:\s*/gi, '$1, ')
+    .replace(/(说|道|喊|问|答|念|嘀咕|低语|嘶吼|呐喊|冷笑道|苦笑道|自嘲道)：/g, '$1: <d>[中文]')
+    .replace(/(says?|said|shouts?|asks?|replies?)\s*:\s*/gi, '$1: <d>[English] ')
 }
 
-/** 生成前完整归一化：引号剥离 + 冒号归一 + 守卫追加 */
+/**
+ * 台词 <d> 标签收口（官方规范，2026-11-05 网络调研后落地）：
+ * H3 官方提示词指南（h3-prompt-writing base-en.txt §4.4/§4.5）：
+ *  - 引号内文字 = 官方指定的「上屏文字」通道（sign/subtitle/neon 一律用引号包裹让模型画出来）
+ *  - 台词唯一正确通道是 <d>[语言]...</d> 标签（纯语音，不上屏）
+ * 我们此前用「」引号包台词，恰好踩进上屏通道 → 三次字幕事故的官方解释。
+ * 本函数在冒号归一后，为每段台词补闭合 </d>（开头 <d> 由 normalizeDialogueColon 注入）。
+ * 无台词标记（没写过 <d>）则原样跳过。
+ */
+export function closeDialogueTags(prompt: string): string {
+  if (!prompt.includes('<d>')) return prompt
+  let inTag = false
+  let lastClose = -1
+  for (let i = 0; i < prompt.length; i++) {
+    if (prompt.startsWith('<d>', i)) { inTag = true; i += 2; continue }
+    if (prompt.startsWith('</d>', i)) { inTag = false; lastClose = i + 3; i += 3; continue }
+  }
+  // 台词区全部未闭合：官方形态是整句台词一个 <d> 块；台词是 prompt 最后的叙事内容，
+  // 因此在整段末尾（守卫后缀追加前）闭合一次即可
+  if (inTag) return prompt + '</d>'
+  return prompt
+}
+
+/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 守卫追加 */
 export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   let text = String(prompt || '')
   if (!text.trim()) return text
   text = stripQuoteMarks(text)
   text = normalizeDialogueColon(text)
+  text = closeDialogueTags(text)
   return appendVideoNegativeGuard(text)
 }
