@@ -8,6 +8,7 @@ import fs from 'node:fs'
 import { getAbsolutePath } from '../utils/storage.js'
 import { downloadVideo, safeTaskError } from './video-download.js'
 import { prepareReferenceAudio, resolveReferenceAudioUrls } from './reference-audio.js'
+import { appendVideoNegativeGuard } from './video-prompt-guards.js'
 import { getActiveConfig, getConfigById } from './ai.js'
 import { now } from '../utils/response.js'
 import { downloadFile, fetchImageAsCompressedDataUrl, generateImageThumb, readImageAsCompressedDataUrl, readImageAsDataUrl, saveBase64Image } from '../utils/storage.js'
@@ -131,6 +132,9 @@ export async function generateVideo(params: GenerateVideoParams): Promise<number
     if (!config) throw new Error('未配置视频模型，请先到「设置」页添加并启用 AI 服务')
 
     params.referenceAudioUrls = await prepareReferenceAudio(params.referenceAudioUrls, config.provider)
+
+    // 全局负向约束（禁字幕/禁旁白/无台词保持安静）：代码级默认，幂等追加，落库即可 SQL 审计
+    params.prompt = appendVideoNegativeGuard(params.prompt)
 
     const id = await createTask('video', config, {
       storyboardId: params.storyboardId,

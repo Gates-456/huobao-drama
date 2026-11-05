@@ -24,6 +24,7 @@ import type {
   VideoPollResponse,
 } from './types'
 import { joinProviderUrl } from './url'
+import { appendVideoNegativeGuard } from '../video-prompt-guards'
 
 const H3_MODEL_PREFIX = 'minimax-h3'
 const DEFAULT_MODEL = 'MiniMax-H3'
@@ -40,7 +41,9 @@ const WORKFLOW_PARAMS = {
   audioVae: 'minimax_h3_audio_vae_fp32.safetensors',
   lora: 'minimax_h3_turbo_v4_step600_ema.safetensors',
   fps: 24,
-  steps: 6,
+  // steps 6→8（2026-11-05）：turbo v4 lora 支持 4~8 步，加步改善高频收敛，
+  // 缓解人脸/动作模糊（实测 325s/步 → 8 步约 44 分钟/镜，用户已确认接受 6-7 分钟级耗时）
+  steps: 8,
   splitDevices: 'cuda:0,cuda:1',
   splitAtBlock: 25,
   blockCounts: '25,25',
@@ -145,6 +148,11 @@ function buildGraph(opts: {
       vae: ['3', 0], token_refiner_device: 'cuda:0', block_counts: WORKFLOW_PARAMS.blockCounts,
     } },
     '6': { class_type: 'MiniMaxH3TurboLoRA', inputs: {
+      // low_vram=true（merge 路径）：LoRA 增量 fold 进 Q8 权重，画质略软但与
+      // MiniMaxH3ModelParallel 双卡拆分（cuda:0/cuda:1 各 25 blocks）兼容。
+      // 实测 bypass(low_vram=false) 虽更锐利，但 bypass hook 与双卡 tensor 拆分冲突，
+      // 9/9 失败：Expected all tensors to be on the same device (cuda:1 vs cuda:0)。
+      // 若未来上单卡大显存机型可试 false 换取锐度。
       model: ['5', 0], lora_name: WORKFLOW_PARAMS.lora, strength: 1.0, low_vram: true,
     } },
     '7': { class_type: 'MiniMaxH3SigmaShift', inputs: { model: ['6', 0], shift_video: 12.0, shift_audio: 3.0 } },
@@ -274,7 +282,7 @@ export class ComfyUIVideoAdapter implements VideoProviderAdapter {
     const res = RESOLUTIONS[(record.resolution || '720p').toLowerCase()] || RESOLUTIONS['720p']
 
     const built = buildGraph({
-      prompt: prompt + identityPass.identityHints.join('') + antiLeak,
+      prompt: appendVideoNegativeGuard(prompt + identityPass.identityHints.join('') + antiLeak),
       seed,
       durationSeconds: duration,
       width: res.width,

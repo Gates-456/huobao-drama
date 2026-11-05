@@ -19,6 +19,7 @@ import { loadAgentPromptFile, loadBasePromptFile } from './prompts.js'
 import { buildLanguageDirective } from './language.js'
 import { getContentLanguageFromRC } from './context.js'
 import { getVoiceReferenceInstructions } from './voice-reference-instructions.js'
+import { getVideoNegativeInstructions } from './video-negative-instructions.js'
 
 // Default prompts (used when workspace/prompts/<type>.md 文件缺失时兜底)
 export const DEFAULT_PROMPTS: Record<string, { name: string; instructions: string }> = {
@@ -113,8 +114,9 @@ video_prompt 规则（硬约束）：
 - 单段格式：整条提示词只有一行，以「0-5秒：」开头，随后写景别/角度 + 谁做什么动作 + 表情细节，再接该镜台词/旁白（台词从 description 提取，不要创作 description 之外的新台词）；不要按 3 秒或多段切分，不要写 0-3 秒/3-5 秒子段
 - 说话主体必须明确唯一：谁做动作、谁说台词写清楚；避免「A 做动作、B 说台词」混在一条里导致视频模型张冠李戴
 - 提到场景用 @场景名、提到角色用 @角色名，名字必须与 read_storyboard_context 返回的列表完全一致（用于挂接参考素材图片与身份绑定）
-- 氛围、光线描述取自该段 atmosphere，简短带过
+ - 氛围、光线描述取自该段 atmosphere，简短带过
 - 用户消息中会告知本次视频模型；本地 MiniMax-H3 按上述单段 5 秒格式写即可
+- 成片负向约束：video_prompt 绝不写入「旁白：…」（旁白只留在 description），不得提出字幕类诉求；只有明确写出的台词允许发声，无台词镜头保持安静
 
 额外要求：
 - 优先复用 read_storyboard_context 返回的 scene_id，不要凭空创造新场景
@@ -147,6 +149,7 @@ video_prompt 规则（硬约束）：
 2. 据此生成 video_prompt：视频管线为本地 MiniMax-H3（固定 5 秒/镜），整条提示词只有一行、以「0-5秒：」开头——先写景别/角度 + 谁做什么动作 + 表情细节，再接该镜台词/旁白；台词/旁白从 description 的「角色名说：「…」」「旁白：…」提取，不要创作 description 之外的新台词；不要按 3 秒或多段切分，不要写 0-3 秒/3-5 秒子段；提到场景用 @场景名、提到角色用 @角色名（名字必须与列表完全一致）；氛围光线取自 atmosphere，简短带过。说话主体必须明确唯一：谁做动作、谁说台词写清楚，避免「A 做动作、B 说台词」混在一条里导致视频模型张冠李戴
 3. 生成时会自动把 @名字 替换为对应参考图片标记（如 @小明 → @图片1小明），因此名字必须精确匹配场景/角色列表，不要缩写或加额外符号
 4. 调用 update_storyboard 保存时参数只传两个键：storyboard_id 和 video_prompt。不要回传该分镜的其他任何字段（title、description、scene_id 等一律不传）
+5. 成片负向约束：video_prompt 绝不写入「旁白：…」（旁白只留在 description），不得提出字幕类诉求；只有明确写出的台词允许发声，无台词镜头保持安静
 
 通用规范：
 - 所有提示词使用本次会话语言指令指定的目标语言输出，单段连贯描述，不要分点，不要混入无关词汇
@@ -361,7 +364,8 @@ function buildInstructions(type: string) {
     const skillInstructions = await loadAgentSkills(type, lang)
     const languageDirective = buildLanguageDirective(lang)
     const voiceInstructions = getVoiceReferenceInstructions(type, lang)
-    return [baseInstructions, skillInstructions, voiceInstructions, languageDirective]
+    const videoNegativeInstructions = getVideoNegativeInstructions(type, lang)
+    return [baseInstructions, skillInstructions, voiceInstructions, videoNegativeInstructions, languageDirective]
       .filter(Boolean)
       .join('\n\n')
   }
