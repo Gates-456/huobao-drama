@@ -24,7 +24,7 @@ import type {
   VideoPollResponse,
 } from './types'
 import { joinProviderUrl } from './url'
-import { appendVideoNegativeGuard } from '../video-prompt-guards'
+import { sanitizeVideoPrompt } from '../video-prompt-guards'
 
 const H3_MODEL_PREFIX = 'minimax-h3'
 const DEFAULT_MODEL = 'MiniMax-H3'
@@ -282,7 +282,7 @@ export class ComfyUIVideoAdapter implements VideoProviderAdapter {
     const res = RESOLUTIONS[(record.resolution || '720p').toLowerCase()] || RESOLUTIONS['720p']
 
     const built = buildGraph({
-      prompt: appendVideoNegativeGuard(prompt + identityPass.identityHints.join('') + antiLeak),
+      prompt: sanitizeVideoPrompt(prompt + identityPass.identityHints.join('') + antiLeak),
       seed,
       durationSeconds: duration,
       width: res.width,

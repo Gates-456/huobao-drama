@@ -21,6 +21,19 @@ const GUARD_SUFFIX = '。画面保持纯净：无任何文字元素、无符号�
   + '声音只包含画面人物自然说出的台词与环境音，台词之外保持安静；'
   + '人物面部清晰锐利、对焦准确，动作细节清楚。'
 
+/**
+ * 台词引号剥离（2026-11-05 第二次教训，task-500 事故）：
+ * 「赌客甲说：「又跌了！…」」中的直角引号会被 H3 连同台词文本一起渲染成画面底部字幕
+ * （字幕上原样带「」符号）。「说：「…」」格式是字幕渲染的强触发模式。
+ * 修复：提交前把台词引号替换为逗号引导（赌客甲说，又跌了！…。），语义不变、触发消失。
+ * 仅剥离引号符号本身，不动台词文字。
+ */
+const QUOTE_CHARS = /["'「」『』“”«»]/g
+
+export function stripQuoteMarks(prompt: string): string {
+  return prompt.replace(QUOTE_CHARS, '')
+}
+
 export function hasVideoNegativeGuard(prompt: string | null | undefined): boolean {
   return String(prompt || '').includes(GUARD_MARKER)
 }
@@ -31,4 +44,14 @@ export function appendVideoNegativeGuard(prompt: string | null | undefined): str
   if (!text.trim()) return text
   if (hasVideoNegativeGuard(text)) return text
   return text + GUARD_SUFFIX
+}
+
+/**
+ * 生成前的完整归一化：剥离台词引号（防字幕渲染）+ 追加正向守卫。
+ * generation.ts 与 comfyui-video.ts 均调用此函数。
+ */
+export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
+  const text = String(prompt || '')
+  if (!text.trim()) return text
+  return appendVideoNegativeGuard(stripQuoteMarks(text))
 }
