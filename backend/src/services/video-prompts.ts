@@ -73,8 +73,8 @@ export async function startVideoPromptBatch(
         await agent.generate([{
           role: 'user',
           content: `请为分镜 #${sb.storyboardNumber}(ID:${sb.id})生成视频提示词(video_prompt)。视频模型:${videoLabel}；本地 MiniMax-H3 管线固定 5 秒/镜，请按 5 秒单段格式生成。
-请先调用 read_storyboard_context 获取该分镜的画面描述(含台词/旁白)、氛围及时长，据此生成 video_prompt(整条提示词只有一行、以「0-5秒：」开头——先写景别/角度+谁做什么动作+表情细节，再接该镜台词；说话主体必须明确唯一，谁做动作、谁说台词写清楚；不要按 3 秒分段、不要写多个子段；台词从 description 的「角色名说：「…」」提取，不要创作 description 之外的新台词；用 @角色名/@场景名/@道具名 引用参考素材，名字与列表完全一致；氛围光线取自 atmosphere,简短带过),然后调用 update_storyboard 保存到分镜 ID:${sb.id}。update_storyboard 参数只传 storyboard_id 和 video_prompt 两个键,不要回传该分镜的其他任何字段,不要重新拆分整集。
-成片负向约束：video_prompt 绝不写入「旁白：…」（旁白只留在 description，成片严禁任何旁白/画外音配音）；不得提出任何字幕/屏幕文字类诉求（成片画面必须纯净无文字）；只有明确写出的台词允许发声，无台词镜头保持安静、严禁角色即兴开口。`,
+请先调用 read_storyboard_context 获取该分镜的画面描述(含台词/旁白)、氛围及时长，据此生成 video_prompt(整条提示词只有一行、以「0-5秒：」开头——先写景别/角度+谁做什么动作+表情细节，再接该镜台词；说话主体必须明确唯一，谁做动作、谁说台词写清楚；不要按 3 秒分段、不要写多个子段；台词从 description 的「角色名说：「…」」提取后转成官方 <d> 通道「角色名说: <d>[中文]台词</d>」，整句包裹在 <d>...</d> 内，不要创作 description 之外的新台词；用 @角色名/@场景名/@道具名 引用参考素材，名字与列表完全一致；氛围光线取自 atmosphere,简短带过),然后调用 update_storyboard 保存到分镜 ID:${sb.id}。update_storyboard 参数只传 storyboard_id 和 video_prompt 两个键,不要回传该分镜的其他任何字段,不要重新拆分整集。
+成片负向约束：video_prompt 绝不写入「旁白：…」（旁白只留在 description，成片严禁任何旁白/画外音配音）；⚠️ 严禁用任何引号（「」『』""）包裹台词或任何文字——H3 官方机制（提示词指南 §4.5）：引号内文字会被渲染到画面上，引号包台词=直接画出字幕；台词只走 <d>[中文]…</d> 通道；不得提出任何字幕/屏幕文字类诉求（成片画面必须纯净无文字）；只有明确写出的台词允许发声，无台词镜头保持安静、严禁角色即兴开口。`,
         }], { maxSteps: 8, requestContext })
         // 以实际落库为准判定成败
         const [fresh] = await db.select().from(schema.storyboards).where(eq(schema.storyboards.id, sb.id))
