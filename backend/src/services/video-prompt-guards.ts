@@ -21,6 +21,38 @@ const GUARD_SUFFIX = '。画面保持纯净：无任何文字元素、无符号�
   + '声音只包含画面人物自然说出的台词与环境音，台词之外保持安静；'
   + '人物面部清晰锐利、对焦准确，动作细节清楚。'
 
+/**
+ * 台词内禁止项（2026-11-06 实测成功形态，task-533 验证）：
+ * 全局守卫后缀（加在 prompt 末尾）对台词镜字幕无效（500/509/510/511 四连出字幕）；
+ * 把禁止项短语放进 <d> 标签内部、紧跟台词（用户 task-533 手动形态），模型在台词
+ * 发声时同步读到呈现约束 → 字幕消失（533 三帧纯净）。此形态为台词镜最终解。
+ */
+const IN_D_PROHIBITION = '【禁止项】不要字幕、不要水印、不要变脸、不要多余商品等，画面内没有任何字幕'
+
+/**
+ * 将禁止项注入到每个 <d> 块内部（闭合标签前）。幂等：块内已有【禁止项】则跳过。
+ * 仅处理台词镜（含 <d> 的 prompt）；无台词镜保持只有全局守卫后缀。
+ */
+export function injectInDProhibition(prompt: string): string {
+  if (!prompt.includes('<d>')) return prompt
+  let out = ''
+  let i = 0
+  while (i < prompt.length) {
+    if (prompt.startsWith('<d>', i)) {
+      // 找到对应闭合标签
+      const close = prompt.indexOf('</d>', i)
+      if (close === -1) { out += prompt.slice(i); break }
+      const body = prompt.slice(i + 3, close)
+      out += '<d>' + (body.includes('【禁止项】') ? body : body + IN_D_PROHIBITION) + '</d>'
+      i = close + 4
+      continue
+    }
+    out += prompt[i]
+    i++
+  }
+  return out
+}
+
 export function hasVideoNegativeGuard(prompt: string | null | undefined): boolean {
   return String(prompt || '').includes(GUARD_MARKER)
 }
@@ -80,12 +112,13 @@ export function closeDialogueTags(prompt: string): string {
   return prompt
 }
 
-/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 守卫追加 */
+/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词内禁止项 → 守卫追加 */
 export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   let text = String(prompt || '')
   if (!text.trim()) return text
   text = stripQuoteMarks(text)
   text = normalizeDialogueColon(text)
   text = closeDialogueTags(text)
+  text = injectInDProhibition(text)
   return appendVideoNegativeGuard(text)
 }
