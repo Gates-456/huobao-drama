@@ -16,35 +16,55 @@ const GUARD_MARKER = '画面保持纯净'
  * 直接写「严禁出现字幕」等否定句会被 H3 当作字幕内容渲染到画面上（task-477 事故）。
  * 因此后缀只写正向诉求（画面纯净、无文字元素、安静），避开「字幕」等否定句式关键词；
  * 强禁令由提示词规范层（L1/L2，写入 LLM instructions）在生成阶段就拦住，不进视频 prompt。
+ *
+ * 2026-11-09 静默句式修正（乱说台词根因之二）：
+ * 旧句「声音只包含画面人物自然说出的台词与环境音」在无台词镜暗示「会有台词」，
+ * 诱导模型即兴开口。改用官方旁白示例的正向静默机制（base-en.txt §4.4）：
+ * `while his lips remain completely closed` —— 人物嘴唇保持闭合 + 只有环境音。
  */
 const GUARD_SUFFIX = '。画面保持纯净：无任何文字元素、无符号标注、无印章图形；'
-  + '声音只包含画面人物自然说出的台词与环境音，台词之外保持安静；'
+  + '画内人物嘴唇保持自然闭合，只有环境音与动作声响；'
   + '人物面部清晰锐利、对焦准确，动作细节清楚。'
 
 /**
- * 台词内禁止项（2026-11-06 实测成功形态，task-533 验证）：
- * 全局守卫后缀（加在 prompt 末尾）对台词镜字幕无效（500/509/510/511 四连出字幕）；
- * 把禁止项短语放进 <d> 标签内部、紧跟台词（用户 task-533 手动形态），模型在台词
- * 发声时同步读到呈现约束 → 字幕消失（533 三帧纯净）。此形态为台词镜最终解。
+ * 台词禁项（终解 2026-11-09，替代 533 形态）：
+ * 533 实证：禁止项贴近台词才对字幕有效（全局后缀远离台词无效，500/509/510/511 四连出字幕）。
+ * 但 533 形态把禁止项放进 <d> 标签内部——官方指南 §4.4 明文「Inside <d>, include only
+ * the language tag and the actual user-provided spoken content」，标签内全部文字会被 TTS
+ * 念出 → 配音会念「不要字幕、不要水印…」（新事故）。
+ * 官方旁白示例给出标签外指令区机制：`...says in an off-screen voiceover: <d>[English]...</d>
+ * while his lips remain completely closed.` —— </d> 之后紧邻文字是发声指令区，不被念出。
+ * 因此把禁止项移到每个 </d> 之后紧邻位置：保留「贴近台词」的有效距离属性，又不进发声通道。
  */
-const IN_D_PROHIBITION = '【禁止项】不要字幕、不要水印、不要变脸、不要多余商品等，画面内没有任何字幕'
+const D_TAIL_PROHIBITION = '。画面纯净：无文字元素、无水印、五官保持稳定不变。'
 
 /**
- * 将禁止项注入到每个 <d> 块内部（闭合标签前）。幂等：块内已有【禁止项】则跳过。
- * 仅处理台词镜（含 <d> 的 prompt）；无台词镜保持只有全局守卫后缀。
+ * 将禁项注入到每个 </d> 闭合标签之后（紧邻，标签外指令区）。
+ * 幂等：闭合标签后已带禁项则跳过；块内已有【禁止项】（533 旧形态）则先移出标签再落位。
  */
 export function injectInDProhibition(prompt: string): string {
-  if (!prompt.includes('<d>')) return prompt
+  if (!prompt.includes('</d>')) return prompt
+  const PROH = '【禁止项】'
   let out = ''
   let i = 0
   while (i < prompt.length) {
     if (prompt.startsWith('<d>', i)) {
-      // 找到对应闭合标签
       const close = prompt.indexOf('</d>', i)
       if (close === -1) { out += prompt.slice(i); break }
-      const body = prompt.slice(i + 3, close)
-      out += '<d>' + (body.includes('【禁止项】') ? body : body + IN_D_PROHIBITION) + '</d>'
+      let body = prompt.slice(i + 3, close)
+      // 533 旧形态清洗：标签内的【禁止项】…段必须移出（否则被 TTS 念出）
+      const prohIdx = body.indexOf(PROH)
+      let legacy = ''
+      if (prohIdx !== -1) {
+        legacy = body.slice(prohIdx)
+        body = body.slice(0, prohIdx)
+        // 清掉残留的旧句尾标点，保持台词体干净
+        body = body.replace(/[。，,]\s*$/, '')
+      }
+      out += '<d>' + body + '</d>'
       i = close + 4
+      // 闭合后若已带新禁项（幂等）则原样；否则注入（旧残留 legacy 丢弃，统一归一为新句式）
+      if (!prompt.startsWith(D_TAIL_PROHIBITION, i)) out += D_TAIL_PROHIBITION
       continue
     }
     out += prompt[i]
@@ -57,10 +77,12 @@ export function hasVideoNegativeGuard(prompt: string | null | undefined): boolea
   return String(prompt || '').includes(GUARD_MARKER)
 }
 
-/** 幂等追加负向约束；空提示词原样返回（不改变上游空值校验行为） */
+/** 幂等追加负向约束；空提示词原样返回（不改变上游空值校验行为）。
+ * 追加前归一接缝叠标点（台词/禁项句终+守卫句首产生「。。」「！。」）。 */
 export function appendVideoNegativeGuard(prompt: string | null | undefined): string {
-  const text = String(prompt || '')
+  let text = String(prompt || '')
   if (!text.trim()) return text
+  text = text.replace(/([。！？.!?])[。]+\s*$/g, '$1')
   if (hasVideoNegativeGuard(text)) return text
   return text + GUARD_SUFFIX
 }
@@ -82,11 +104,25 @@ export function stripQuoteMarks(prompt: string): string {
   return prompt.replace(QUOTE_CHARS, '')
 }
 
-/** 「说：」「道：」等冒号引导统一转成官方 <d> 对话通道（引号与冒号+文本块都会触发字幕渲染） */
+/** 「说：」「道：」等冒号引导统一转成官方 <d> 对话通道（引号与冒号+文本块都会触发字幕渲染）。
+ * 2026-11-09 多 cue 闭合：第 2 条及以后的 cue 前先补 </d> 闭合上一台词体——
+ * 否则上一 <d> 到段尾才闭合，cue 之间的叙事与后续台词全被卷进同一台词体被 TTS 念出（乱说台词根因）。
+ * 动词短语整体捕获（含前缀修饰，如「大喊」「冷笑说」「压低声说」≤4字）：只匹配动词本身会把
+ * 「大喊」拆成「大」+「喊」，残字被卷进上一台词体。台词体保持完整：整句台词
+ * （含句终标点，如「又跌了！今天谁买谁赔死！」）留在同一 <d> 块内（task-533 验证形态）。 */
 export function normalizeDialogueColon(prompt: string): string {
+  let cueOpen = false
   return prompt
-    .replace(/(说|道|喊|问|答|念|嘀咕|低语|嘶吼|呐喊|冷笑道|苦笑道|自嘲道)：/g, '$1: <d>[中文]')
-    .replace(/(says?|said|shouts?|asks?|replies?)\s*:\s*/gi, '$1: <d>[English] ')
+    .replace(/([^。！？；\n:：]{0,4}[说道喊问答念])[：:](?! *<d>)/g, (_m, phrase: string) => {
+      const close = cueOpen ? '</d>' : ''
+      cueOpen = true
+      return `${close}${phrase}: <d>[中文]`
+    })
+    .replace(/([^.!?\n:]{0,30}\b(?:says?|said|shouts?|asks?|replies?|whispers?|mutters?)\b)\s*:\s*(?! *<d>)/gi, (_m, phrase: string) => {
+      const close = cueOpen ? '</d>' : ''
+      cueOpen = true
+      return `${close}${phrase}: <d>[English] `
+    })
 }
 
 /**
@@ -95,30 +131,93 @@ export function normalizeDialogueColon(prompt: string): string {
  *  - 引号内文字 = 官方指定的「上屏文字」通道（sign/subtitle/neon 一律用引号包裹让模型画出来）
  *  - 台词唯一正确通道是 <d>[语言]...</d> 标签（纯语音，不上屏）
  * 我们此前用「」引号包台词，恰好踩进上屏通道 → 三次字幕事故的官方解释。
- * 本函数在冒号归一后，为每段台词补闭合 </d>（开头 <d> 由 normalizeDialogueColon 注入）。
- * 无台词标记（没写过 <d>）则原样跳过。
+ * 本函数在冒号归一后，为段尾仍打开的台词体补闭合 </d>。
+ * 多 cue 之间的闭合已由 normalizeDialogueColon 在每条新 cue 前完成；
+ * 2026-11-09 修复：显式 </d> 出现后若段内还有未配对的 <d>，状态机正确推进（旧实现 index 步进错位）。
  */
 export function closeDialogueTags(prompt: string): string {
   if (!prompt.includes('<d>')) return prompt
+  // 台词体结束边界：仅叙事连接词（cue 间闭合已由 normalizeDialogueColon 注入 </d> 保证；
+  // 遇未闭合 <d> 再开新 cue 时由下方状态机就地补闭合）。注意不得用「画面/镜头」等常见词——
+  // 会撞上禁项正文与叙事描述，把台词体拦腰截断。
+  const CONNECTIVE = /(随后|接着|然后|紧接着|与此同时)/
+  let out = ''
+  let i = 0
   let inTag = false
-  let lastClose = -1
-  for (let i = 0; i < prompt.length; i++) {
-    if (prompt.startsWith('<d>', i)) { inTag = true; i += 2; continue }
-    if (prompt.startsWith('</d>', i)) { inTag = false; lastClose = i + 3; i += 3; continue }
+  while (i < prompt.length) {
+    if (prompt.startsWith('<d>', i)) {
+      if (inTag) out += '</d>'
+      out += '<d>'
+      inTag = true
+      i += 3
+      continue
+    }
+    if (prompt.startsWith('</d>', i)) {
+      out += '</d>'
+      inTag = false
+      i += 4
+      continue
+    }
+    if (inTag) {
+      const rest = prompt.slice(i)
+      // 边界必须出现在下一个标签记号之前（否则交给标签状态机处理）
+      const nextTagIdx = [rest.indexOf('<d>'), rest.indexOf('</d>')].filter(n => n >= 0).sort((a, b) => a - b)[0] ?? -1
+      const m = rest.slice(0, nextTagIdx === -1 ? undefined : nextTagIdx).match(CONNECTIVE)
+      if (m && m.index !== undefined && m.index > 0) {
+        out += rest.slice(0, m.index) + '</d>'
+        inTag = false
+        i += m.index
+        continue
+      }
+    }
+    out += prompt[i]
+    i++
   }
-  // 台词区全部未闭合：官方形态是整句台词一个 <d> 块；台词是 prompt 最后的叙事内容，
-  // 因此在整段末尾（守卫后缀追加前）闭合一次即可
-  if (inTag) return prompt + '</d>'
-  return prompt
+  if (inTag) out += '</d>'
+  return out
 }
 
-/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词内禁止项 → 守卫追加 */
+/**
+ * 台词体提纯（官方 §4.4 标签纯度要求：Inside <d>, include only the language tag
+ * and the actual spoken content）：
+ * 保守清理——整句多句台词是合法形态（task-533 验证：「又跌了！今天谁买谁赔死！」单块两叹句），
+ * 不得按句终标点截断；只做三件事：
+ *  1. 保留/规范开头语言标签 [中文]/[English]…
+ *  2. 去除首尾空白
+ *  3. 剔除标签内 533 旧形态残留的【禁止项】…段（会被 TTS 念出，由 injectInDProhibition 统一在标签外重注）
+ */
+export function purifyDialogueBodies(prompt: string): string {
+  if (!prompt.includes('<d>')) return prompt
+  let out = ''
+  let i = 0
+  while (i < prompt.length) {
+    if (prompt.startsWith('<d>', i)) {
+      const close = prompt.indexOf('</d>', i)
+      if (close === -1) { out += prompt.slice(i); break }
+      let body = prompt.slice(i + 3, close).trim()
+      const lang = body.match(/^\s*(\[[^\]]{1,20}\])/)
+      if (lang) body = body.slice(lang[0].length).trim()
+      // 533 旧形态残留：标签内【禁止项】…整段剔除（injectInDProhibition 会在标签外重注归一版）
+      const prohIdx = body.indexOf('【禁止项】')
+      if (prohIdx !== -1) body = body.slice(0, prohIdx).trim()
+      out += '<d>' + (lang ? lang[1] : '') + body + '</d>'
+      i = close + 4
+      continue
+    }
+    out += prompt[i]
+    i++
+  }
+  return out
+}
+
+/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 标签外禁项 → 守卫追加 */
 export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   let text = String(prompt || '')
   if (!text.trim()) return text
   text = stripQuoteMarks(text)
   text = normalizeDialogueColon(text)
   text = closeDialogueTags(text)
+  text = purifyDialogueBodies(text)
   text = injectInDProhibition(text)
   return appendVideoNegativeGuard(text)
 }
