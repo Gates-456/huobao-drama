@@ -21,10 +21,23 @@ const GUARD_MARKER = '画面保持纯净'
  * 旧句「声音只包含画面人物自然说出的台词与环境音」在无台词镜暗示「会有台词」，
  * 诱导模型即兴开口。改用官方旁白示例的正向静默机制（base-en.txt §4.4）：
  * `while his lips remain completely closed` —— 人物嘴唇保持闭合 + 只有环境音。
+ *
+ * 2026-11-11 音景声明（项目21全量38镜筛查后定稿，无台词镜吟诵/群像配音根因）：
+ * 22 个无台词镜中 10 镜出现旁白腔吟诵人声（空镜被配解说腔）、群像镜出现即兴
+ * 对话声（t634 帧证张嘴+nsr=0.01 真人声）——根因是 H3 `audio_mode: native`
+ * 对未声明音景的镜头自由发挥。官方 §4.6 要求 overall_soundscape 显式声明。
+ *
+ * 2026-11-11 四轮定稿（官方三字段机制，task-642 残余吟诵根因）：
+ * 官方指南 §2.2 明文提示词三字段结构：integrated_multimodal_description /
+ * overall_soundscape / non_diegetic_music。环境音必须写在 `overall_soundscape:`
+ * 独立字段（模型把它路由到音频条件器）；内联在正文里的环境音描述会被当
+ * 旁白稿吟出（t642「终合检承摩」≈「衣料摩擦」被吟，帧证 2.4s 幻现人脸）。
+ * 定稿守卫句：正文只保留画面诉求；音景走官方字段；§4.4 不说话角色不配
+ * speaker ID；§4.6 允许非语言人声（远处人群嗡嗡属合法音景）。
  */
 const GUARD_SUFFIX = '。画面保持纯净：无任何文字元素、无符号标注、无印章图形；'
-  + '画内人物嘴唇保持自然闭合，只有环境音与动作声响；'
-  + '人物面部清晰锐利、对焦准确，动作细节清楚。'
+  + '画内人物嘴唇保持自然闭合、神情专注，人物面部清晰锐利、对焦准确，动作细节清楚。'
+  + ' overall_soundscape：风声掠过石墙，脚步落在石板上，衣料摩擦声。non_diegetic_music：N/A'
 
 /**
  * 台词禁项（终解 2026-11-09，替代 533 形态）：
@@ -137,10 +150,12 @@ export function normalizeDialogueColon(prompt: string): string {
  */
 export function closeDialogueTags(prompt: string): string {
   if (!prompt.includes('<d>')) return prompt
-  // 台词体结束边界：仅叙事连接词（cue 间闭合已由 normalizeDialogueColon 注入 </d> 保证；
-  // 遇未闭合 <d> 再开新 cue 时由下方状态机就地补闭合）。注意不得用「画面/镜头」等常见词——
-  // 会撞上禁项正文与叙事描述，把台词体拦腰截断。
-  const CONNECTIVE = /(随后|接着|然后|紧接着|与此同时)/
+  // 台词体结束边界：叙事连接词 + 群像描写起始（周围人/众人/人群/人们+动作描写出现在
+  // 台词体内 = 台词已说完，后面是叙事——不切会把群像叙述卷进台词体被 TTS 念出）。
+  // cue 间闭合已由 normalizeDialogueColon 注入 </d> 保证；遇未闭合 <d> 再开新 cue
+  // 时由下方状态机就地补闭合。注意不得用「画面/镜头」等常见词——会撞上禁项正文与
+  // 叙事描述，把台词体拦腰截断。
+  const CONNECTIVE = /(随后|接着|然后|紧接着|与此同时|周围[^，。；]{0,6}(说|喊|议论|笑)|众人|人群|人们)/
   let out = ''
   let i = 0
   let inTag = false
@@ -210,7 +225,53 @@ export function purifyDialogueBodies(prompt: string): string {
   return out
 }
 
-/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 标签外禁项 → 守卫追加 */
+/**
+ * 无台词镜人声诱因清除（2026-11-11 第三轮，task-640/641 残余根因）：
+ * ① 「环境声热闹」「笑声回响」是热闹暗示（H3 照着配人声）；② 「无角色开口」「画面
+ * 无人说话」仍是否定句（H3 对否定句的处理是把被否定对象念出来——task-477/636 同源）；
+ * ③ 人群嗡嗡句在无人群镜被误注入（「目光送走远去的少年们」是叙事不是画面人群）。
+ * 修复：热闹/笑声词直接替换为环境音描述；否定人声句整体删除（守卫的嘴唇闭合+正向
+ * 音景句已覆盖其职能）；嗡嗡句只在画面真正描述人群聚集时注入（收紧正则）。
+ * 只处理无台词镜；台词镜的引导词已先被 normalizeDialogueColon 转走。
+ */
+export function demoteCrowdVocals(prompt: string): string {
+  if (prompt.includes('<d>')) return prompt
+  let out = prompt
+  // 发声动词（说笑/说闹/交谈低语/议论/低喝/齐喝/呐喊/应喝/喧哗/念叨）→ 无声神态/背景嗡嗡声
+  out = out
+    .replace(/说笑/g, '相互笑语神态')
+    .replace(/谈笑/g, '相互笑语神态')
+    .replace(/低喝/g, '发力呼气神态')
+    .replace(/齐喝/g, '齐声呼气神态')
+    .replace(/应喝/g, '呼气回应神态')
+    .replace(/议论/g, '交换眼色神态')
+    .replace(/喧哗/g, '热闹走动')
+    .replace(/念叨/g, '低声神态')
+  // 热闹暗示 → 中性环境音（「环境声热闹」会诱导 H3 配人声垫底）
+  out = out
+    .replace(/环境声热闹/g, '画面安静')
+    .replace(/笑声回响/g, '衣袂飘动')
+    .replace(/，笑声不断/g, '')
+    .replace(/笑声阵阵/g, '衣袂飘动')
+  // 否定人声句整体删除：守卫后缀已有正向嘴唇闭合+音景句，这些否定句只会诱导念白
+  out = out
+    .replace(/[，。]?无角色开口/g, '')
+    .replace(/[，。]?画面无人说话/g, '')
+    .replace(/[，。]?无人说话/g, '')
+    .replace(/[，。]?画面安静无台词/g, '画面安静')
+    .replace(/[，。]?无人物无台词/g, '')
+    .replace(/[，。]?无台词/g, '')
+    .replace(/[，。]?无角色开口说话/g, '')
+  // 人群嗡嗡句：官方 §4.6 允许音景含非语言人声；只在画面明确出现成群人群聚集时
+  // 注入（「少年们三两成队」才扩大化误伤「目光送走远去的少年们」这类叙事），
+  // 且落在 overall_soundscape 语义内（远处=不可辨词=合法非语言人声）
+  if (/(少年们|众人|人群|人们|弟子们|族人)[^。]{0,12}(三两成队|列成方阵|成群|聚集|围在|簇拥)/.test(out) && !out.includes('嗡嗡')) {
+    out += '。远处人群的轻微嗡嗡声混入风声。'
+  }
+  return out
+}
+
+/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 群像配音降级 → 标签外禁项 → 守卫追加 */
 export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   let text = String(prompt || '')
   if (!text.trim()) return text
@@ -218,6 +279,7 @@ export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   text = normalizeDialogueColon(text)
   text = closeDialogueTags(text)
   text = purifyDialogueBodies(text)
+  text = demoteCrowdVocals(text)
   text = injectInDProhibition(text)
   return appendVideoNegativeGuard(text)
 }
