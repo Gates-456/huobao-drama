@@ -118,24 +118,63 @@ export function stripQuoteMarks(prompt: string): string {
 }
 
 /** 「说：」「道：」等冒号引导统一转成官方 <d> 对话通道（引号与冒号+文本块都会触发字幕渲染）。
- * 2026-11-09 多 cue 闭合：第 2 条及以后的 cue 前先补 </d> 闭合上一台词体——
+ * 2026-11-09 多 cue 闭合：第 2 条及以后的台词 cue 前先补 </d> 闭合上一台词体——
  * 否则上一 <d> 到段尾才闭合，cue 之间的叙事与后续台词全被卷进同一台词体被 TTS 念出（乱说台词根因）。
  * 动词短语整体捕获（含前缀修饰，如「大喊」「冷笑说」「压低声说」≤4字）：只匹配动词本身会把
  * 「大喊」拆成「大」+「喊」，残字被卷进上一台词体。台词体保持完整：整句台词
- * （含句终标点，如「又跌了！今天谁买谁赔死！」）留在同一 <d> 块内（task-533 验证形态）。 */
+ * （含句终标点，如「又跌了！今天谁买谁赔死！」）留在同一 <d> 块内（task-533 验证形态）。
+ * 2026-11-11 speaker ID 注入（task-653 事故）：官方 §4.4 要求开口角色带 (S1)/(S2)
+ * 稳定说话人 ID——无 ID 时 H3 让角色在台词前自我报姓名（「武买昆叶战雄」烧字幕+即兴
+ * 开场白「是」）。同一角色名复用同 ID；不同角色名按出现顺序分配新 ID。 */
 export function normalizeDialogueColon(prompt: string): string {
   let cueOpen = false
   return prompt
-    .replace(/([^。！？；\n:：]{0,4}[说道喊问答念])[：:](?! *<d>)/g, (_m, phrase: string) => {
-      const close = cueOpen ? '</d>' : ''
-      cueOpen = true
-      return `${close}${phrase}: <d>[中文]`
-    })
+    // name=动词组前最近的中文名段（2-8字，跳过中间动作描写），verbPhrase=连接副词+发声修饰+动词组。
+    // 「叶辰又说」→ ID 复用同 key；「叶战雄……随后开口说」→ key=叶战雄（跳过中间描写）。
+    .replace(/([\u4e00-\u9fa5A-Za-z0-9_]{2,8}?)[^。！？\n:：]{0,40}?((?:又|再|随后|接着|紧接着)*(?:开口|朗声|沉声|低声|高声|厉声|冷声|哑声|压低声)*(?:说道|说|道|喊道|喊|问道|问|答道|答|念道|念)[：:])(?! *<d>)/g,
+      (_m, name: string, verbPhrase: string) => {
+        const close = cueOpen ? '</d>' : ''
+        cueOpen = true
+        const key = name.replace(/^(?:又|再|随后|接着|紧接着)+/, '') || name
+        return `${close}${key}${verbPhrase}<d>[中文]`
+      })
     .replace(/([^.!?\n:]{0,30}\b(?:says?|said|shouts?|asks?|replies?|whispers?|mutters?)\b)\s*:\s*(?! *<d>)/gi, (_m, phrase: string) => {
       const close = cueOpen ? '</d>' : ''
       cueOpen = true
       return `${close}${phrase}: <d>[English] `
     })
+}
+
+/**
+ * speaker ID 注入（官方 §4.4：开口角色带 (S1)/(S2) 稳定说话人 ID；task-653 事故——
+ * 无 ID 时 H3 让角色在台词前自我报姓名：「武买昆叶战雄」烧字幕+即兴开场白「是」）。
+ * 独立于 normalizeDialogueColon 之后执行：此时台词 cue 已统一为「XXX说: <d>[语言]」
+ * 形态，直接对每个 cue 前的人名段（跳过中间动作描写）注入/复用 ID。
+ * 幂等：cue 已带 (S\d+) 则跳过。
+ */
+export function injectSpeakerIds(prompt: string): string {
+  if (!prompt.includes('<d>')) return prompt
+  const speakerIds = new Map<string, string>()
+  let nextId = 1
+  // 保守形态：人名(2-6字)紧贴动词组（跳段≤6字，只允许连接副词/发声修饰）——
+  // 长描述 cue（人名后带动作描写）不注入（交给 L1 规范由 LLM 写 ID），宁可漏注不误插。
+  return prompt.replace(
+    /([\u4e00-\u9fa5A-Za-z0-9_]{2,6})((?:(?:又|再)|(?:(?:随后|接着|紧接着))*(?:开口|朗声|沉声|低声|高声|厉声|冷声|哑声|压低声))?(?:说道|说|道|喊道|喊|问道|问|答道|答|念道|念))[：:]\s*<d>/g,
+    (_m, name: string, verbPhrase: string) => {
+      // 「叶辰又说」的「又」是连接副词不是名字一部分——剥尾归 key（三字名带「又」极罕见）
+      const key = name.replace(/(?:又|再)$/, '') || name
+      const existing = _m.match(/\((S\d+)\)/)
+      if (existing) {
+        if (!speakerIds.has(key)) speakerIds.set(key, existing[1])
+        return _m
+      }
+      const known = speakerIds.get(key)
+      const id = known ?? `(S${nextId++})`
+      if (!known) speakerIds.set(key, id)
+      // ID 紧贴动词组（叶辰(S1)又说 / 随后开口(S1)说）——官方语义 ID 锚定说话人即可
+      return `${key}${id}${verbPhrase.replace(key, '')}: <d>`
+    }
+  )
 }
 
 /**
@@ -271,7 +310,7 @@ export function demoteCrowdVocals(prompt: string): string {
   return out
 }
 
-/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 群像配音降级 → 标签外禁项 → 守卫追加 */
+/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 群像配音降级 → 标签外禁项 → speaker ID → 守卫追加 */
 export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   let text = String(prompt || '')
   if (!text.trim()) return text
@@ -281,5 +320,6 @@ export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   text = purifyDialogueBodies(text)
   text = demoteCrowdVocals(text)
   text = injectInDProhibition(text)
+  text = injectSpeakerIds(text)
   return appendVideoNegativeGuard(text)
 }
