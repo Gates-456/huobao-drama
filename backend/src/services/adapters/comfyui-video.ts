@@ -125,6 +125,43 @@ function lengthForDuration(seconds: number): number {
   return Math.min(725, Math.max(25, Math.round(seconds * fps) + 1))
 }
 
+/**
+ * 官方三字段结构转译（2026-11-11，空镜吟诵根治——官方指南 §2.2/§5.3）：
+ * H3 官方最终 prompt 是固定三字段英文结构（字段名为英文原文）：
+ *   integrated_multimodal_description: [Shot 1] ...
+ *   overall_soundscape: ...
+ *   non_diegetic_music: ...
+ * 我们此前的中文正文+「overall_soundscape：」中文标签是形似——模型对非官方
+ * 格式的遵循度弱，正文中的环境音词（风声/衣料摩擦）仍被当旁白稿吟出（t683）。
+ * 本函数在 sanitize 之后执行，把中文 prompt 重排为官方结构：
+ *  - 正文（去掉守卫尾巴）→ integrated_multimodal_description: 字段
+ *  - 守卫句中的音景句剔除，音景统一写入 overall_soundscape: 字段（§4.6 要求写
+ *    具体环境音 1-4 句，只有用户明确要求全程静默才写 N/A——上一版 N/A 是误用）
+ *  - 末尾补 non_diegetic_music: N/A（无配乐需求）
+ * @param prompt sanitize 后的完整 prompt（可能含「画面保持纯净…overall_soundscape：…」守卫段）
+ * @param hasRefImages 是否挂参考图（Ref2VA 场景补 <Picture 1> 锚定句，官方 §5.3：
+ *        the shot begins from <Picture 1> —— 告诉模型参考图是画面锚而非旁白素材，
+ *        直击「场景图带匾额文字→脑补叙述者」的空镜吟诵根因）
+ */
+export function toOfficialFields(prompt: string, hasRefImages: boolean): string {
+  const GUARD_HEAD = '画面保持纯净'
+  // 拆守卫段：正文 = 守卫头之前；守卫段里的 overall_soundscape 中文版丢弃（重写为官方英文段）
+  const guardIdx = prompt.indexOf(GUARD_HEAD)
+  const body = guardIdx >= 0 ? prompt.slice(0, guardIdx).replace(/[，,。]\s*$/, '') : prompt
+  // 正文剔除残留音景词句（由官方字段接管）
+  const bodyClean = body
+    .replace(/画面纯净：无文字元素、无水印、五官保持稳定不变。?/g, '')
+    .replace(/环境音只有[^；。]*[；。]?/g, '')
+    .replace(/overall_soundscape：[^]*$/g, '')
+    .replace(/[，,]\s*$/, '')
+  const anchor = hasRefImages
+    ? 'The shot begins from <Picture 1>, which defines the scene composition, palette, and set dressing; on-screen signage in the reference is background texture only, with no narrator and no spoken commentary. '
+    : ''
+  const bodyField = `integrated_multimodal_description: [Shot 1] Live-action, cinematic. ${anchor}${bodyClean.trim()}`
+  const soundscape = 'overall_soundscape: Wind sweeps across stone ramparts and drifts through the valley; footsteps press on worn flagstones; fabric sways and brushes softly. No dialogue, no narration, and no vocal tones occur anywhere in the video.'
+  return `${bodyField}\n\n${soundscape}\n\nnon_diegetic_music: N/A`
+}
+
 /** 构建工作流节点图（API 格式） */
 function buildGraph(opts: {
   prompt: string
@@ -282,7 +319,10 @@ export class ComfyUIVideoAdapter implements VideoProviderAdapter {
     const res = RESOLUTIONS[(record.resolution || '720p').toLowerCase()] || RESOLUTIONS['720p']
 
     const built = buildGraph({
-      prompt: sanitizeVideoPrompt(prompt + identityPass.identityHints.join('') + antiLeak),
+      prompt: toOfficialFields(
+        sanitizeVideoPrompt(prompt + identityPass.identityHints.join('') + antiLeak),
+        refNames.length > 0 || Boolean(firstFrameName),
+      ),
       seed,
       durationSeconds: duration,
       width: res.width,
