@@ -265,6 +265,84 @@ export function purifyDialogueBodies(prompt: string): string {
 }
 
 /**
+ * 台词预算估算（2026-11-13 台词截断根治）：
+ * ep23 实测（ffprobe silencedetect，16 已生成台词镜）：6 镜语音顶满 5.0s 被硬切
+ * （镜8/10/16/22/26 等「话没讲完突然切镜」的直接根因），镜14 语音仅占前 1.3s。
+ * H3 有效中文语速约 3.2 字/秒（含标点顿），远低于 L1 旧规范的 4.5 字/秒假设。
+ * 统计所有 <d> 块内有效字数（CJK 每字 1；连续英文/数字每 2 字符 1；标点不计），
+ * 返回 3.2 字/秒下的说话秒数。
+ */
+export function estimateDialogueSeconds(prompt: string): number {
+  let total = 0
+  const re = /<d>([^]*?)<\/d>/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(prompt)) !== null) {
+    const body = (m[1] || '').replace(/^\s*\[[^\]]{1,20}\]/, '')
+    const cjk = (body.match(/[\u4e00-\u9fa5]/g) || []).length
+    const latinWords = (body.match(/[A-Za-z0-9]+/g) || []).reduce((acc, w) => acc + Math.ceil(w.length / 2), 0)
+    total += cjk + latinWords
+  }
+  return Math.round(total / 3.2 * 100) / 100
+}
+
+/**
+ * 开口铺垫压缩（2026-11-13 台词截断根治，与 estimateDialogueSeconds 配套）：
+ * 台词预算 >3.6s（5s 镜留 1.4s 尾余量后说不完）时，把说话 cue 前的整段动作/表情
+ * 铺垫（从主体段(@)后的最后一个完整逗号段起，含「、」连接的长链表情）回溯删除，
+ * cue 前统一为「随即」，保证角色尽早开口。
+ * 保护规则：含 @ 的主体引入段不删；(S\d) speaker ID 段视为 cue 主体跳过；
+ * cue 前已是「随即」视为已压缩（幂等标记）。台词本体不动（台词超长属拆镜问题，
+ * 由 L1 预算规则拦住）。ep23 镜53 实证：顿号表情链不删时 H3 仍拖到 1.67s 才开口。
+ */
+export function trimDialogueLeadIn(prompt: string): string {
+  if (estimateDialogueSeconds(prompt) <= 3.6) return prompt
+  if (!prompt.includes('<d>')) return prompt
+  // 说话 cue：m1=可选连接词，m2=动词组+<d>（与 normalizeDialogueColon 动词组一致）
+  const CUE = /((?:随后|接着|紧接着|然后)?)((?:开口|朗声|沉声|低声|高声|厉声|冷声|哑声|压低声)*(?:说道|说|道|喊道|喊|问道|问|答道|答|念道|念)[：:]\s*<d>)/g
+  let out = ''
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = CUE.exec(prompt)) !== null) {
+    const cueStart = m.index
+    // 幂等标记：cue 前已是「随即」则视为已压缩，跳过
+    if (prompt.slice(Math.max(last, cueStart - 2), cueStart) === '随即') {
+      out += prompt.slice(last, cueStart + m[0].length)
+      last = cueStart + m[0].length
+      continue
+    }
+    // 从 cue 向左回溯整段铺垫：越过 (S\d) 段与「随即…开口」连接段后，
+    // 找到主体段(@)边界的「，」，中间的铺垫整段删除。
+    let probe = cueStart
+    let cutFrom = -1
+    for (let step = 0; step < 8; step++) {
+      const sep = Math.max(
+        prompt.lastIndexOf('，', probe - 1), prompt.lastIndexOf(',', probe - 1),
+        prompt.lastIndexOf('、', probe - 1),
+      )
+      if (sep < last) break
+      const seg = prompt.slice(sep + 1, probe)
+      if (seg.includes('@')) break
+      // speaker ID 段与纯连接段（随即/随后+开口动词）跳过不计，继续向左
+      if (/\(S\d+\)$/.test(seg) || /^(?:随即|随后|接着|紧接着|然后)?(?:低声|沉声|朗声|高声|开口)?$/.test(seg.replace(/(?:开口|说道|说|道|喊道|喊|问道|问|答道|答|念道|念)[：:]$/, ''))) {
+        probe = sep
+        continue
+      }
+      cutFrom = sep
+      probe = sep
+    }
+    if (cutFrom >= last) {
+      out += prompt.slice(last, cutFrom + 1) + '随即' + m[2]
+      last = cueStart + m[0].length
+      continue
+    }
+    out += prompt.slice(last, cueStart + m[0].length)
+    last = cueStart + m[0].length
+  }
+  out += prompt.slice(last)
+  return out
+}
+
+/**
  * 无台词镜人声诱因清除（2026-11-11 第三轮，task-640/641 残余根因）：
  * ① 「环境声热闹」「笑声回响」是热闹暗示（H3 照着配人声）；② 「无角色开口」「画面
  * 无人说话」仍是否定句（H3 对否定句的处理是把被否定对象念出来——task-477/636 同源）；
@@ -310,7 +388,7 @@ export function demoteCrowdVocals(prompt: string): string {
   return out
 }
 
-/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 群像配音降级 → 标签外禁项 → speaker ID → 守卫追加 */
+/** 生成前完整归一化：引号剥离 → 冒号转 <d> 对话通道 → 闭合标签 → 台词体提纯 → 群像配音降级 → 开口铺垫压缩（台词预算>4s） → 标签外禁项 → speaker ID → 守卫追加 */
 export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   let text = String(prompt || '')
   if (!text.trim()) return text
@@ -319,6 +397,7 @@ export function sanitizeVideoPrompt(prompt: string | null | undefined): string {
   text = closeDialogueTags(text)
   text = purifyDialogueBodies(text)
   text = demoteCrowdVocals(text)
+  text = trimDialogueLeadIn(text)
   text = injectInDProhibition(text)
   text = injectSpeakerIds(text)
   return appendVideoNegativeGuard(text)

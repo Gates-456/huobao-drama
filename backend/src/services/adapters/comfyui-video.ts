@@ -145,6 +145,10 @@ function lengthForDuration(seconds: number): number {
  */
 export function toOfficialFields(prompt: string, hasRefImages: boolean): string {
   const GUARD_HEAD = '画面保持纯净'
+// 台词时机提示（2026-11-13 台词截断根治）：ep23 实测 H3 有效语速 ~3.2 字/s，
+// 晚开口（长动作铺垫后）= 台词顶满 5.0s 被硬切。官方 §4.4 台词跟在动作后，
+// 时间轴上越早开始越可能说完。仅台词镜（含 <d>）注入。
+const DIALOGUE_TIMING_HINT = 'The character begins speaking as early as the action allows, with at most a brief one-second lead-in gesture before the dialogue starts, and the spoken line finishes comfortably before the video ends. '
   // 拆守卫段：正文 = 守卫头之前；守卫段里的 overall_soundscape 中文版丢弃（重写为官方英文段）
   const guardIdx = prompt.indexOf(GUARD_HEAD)
   const body = guardIdx >= 0 ? prompt.slice(0, guardIdx).replace(/[，,。]\s*$/, '') : prompt
@@ -157,7 +161,8 @@ export function toOfficialFields(prompt: string, hasRefImages: boolean): string 
   const anchor = hasRefImages
     ? 'The shot begins from <Picture 1>, which defines the scene composition, palette, and set dressing; on-screen signage in the reference is background texture only, with no narrator and no spoken commentary. '
     : ''
-  const bodyField = `integrated_multimodal_description: [Shot 1] Live-action, cinematic. ${anchor}${bodyClean.trim()}`
+  const timingHint = bodyClean.includes('<d>') ? DIALOGUE_TIMING_HINT : ''
+  const bodyField = `integrated_multimodal_description: [Shot 1] Live-action, cinematic. ${anchor}${timingHint}${bodyClean.trim()}`
   const soundscape = 'overall_soundscape: Wind sweeps across stone ramparts and drifts through the valley; footsteps press on worn flagstones; fabric sways and brushes softly. No dialogue, no narration, and no vocal tones occur anywhere in the video.'
   return `${bodyField}\n\n${soundscape}\n\nnon_diegetic_music: N/A`
 }
