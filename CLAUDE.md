@@ -45,6 +45,7 @@ configs/   — 遗留死配置，代码零引用
 - **AI Agents**: Mastra，4 个 agent（script_rewriter / extractor / storyboard_breaker / prompt_generator），instructions 从 `workspace/prompts/*.md` + skills 动态拼接，模型按请求解析；fetch 补丁链适配国内中转站（关思考/温度/max_tokens）
 - **媒体生成**: `services/generation.ts` 统一任务生命周期（sys_task 表），适配器模式：图片 openai/gemini/volcengine，视频 volcengine/minimax
 - **视频拼接**: `services/ffmpeg-merge.ts`，FFmpeg 二进制内置（ffmpeg-static），可用 `FFMPEG_BIN`/`FFPROBE_BIN` 覆盖
+- **本地 H3 管线**: 视频适配器 `comfyui` 指向本机 ComfyUI `:8193`（工作目录 `/mnt/sda/vlm/minimax-h3-gguf-q8-opt-20260915`）。该服务由 `start_gguf_tmux.sh` 启动、`watchdog_gguf.sh` 看护（cron 每 3 分钟 + 内存门槛 + 重启宽限 + 连续失败抑制）。`/history` 不持久化，重启即丢在途任务——运维与 OOM 恢复见 `docs/comfyui-oom-watchdog.md`
 
 ### Frontend
 - Nuxt 3 SPA，动态路由在 `nuxt.config.ts` 的 `pages:extend` 手动注册（views/drama/）

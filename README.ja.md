@@ -501,6 +501,12 @@ A: バックエンドが起動しているか、ポートが正しいかを確�
 
 A: バックエンドは初回起動時に全テーブルを自動作成します。ログで初期化が成功したか確認してください。
 
+### Q: ローカル ComfyUI（MiniMax-H3）の絵コンテで「サーバーに接続できません」と出る？
+
+A: このエラーはバックエンドが ComfyUI の 8193 ポートに到達できないことを意味し、多くは ComfyUI プロセスが既に終了しています。最頻の原因はマシンのメモリ枯渇によりカーネルの OOM killer に強制終了されたケースです（ログに `Out of memory: Killed process`）。まず `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8193/` と `MemAvailable` を確認し、`start_gguf_tmux.sh` で起動してください。リポジトリには `watchdog_gguf.sh`（cron で 3 分間隔、メモリ下限・起動猶予・連続失敗の抑制付き）を同梱しており、自動復旧に利用できます。詳細は [docs/comfyui-oom-watchdog.md](docs/comfyui-oom-watchdog.md) を参照してください。
+
+> 注意: ComfyUI の `/history` はプロセスメモリ上にのみ存在し再起動で消えるため、中断時に実行中だったタスクは復旧できず再生成が必要です。
+
 ---
 
 ## 📋 更新履歴

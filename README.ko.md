@@ -501,6 +501,12 @@ A: 백엔드가 시작되었는지, 포트가 올바른지 확인하세요. 개�
 
 A: 백엔드는 최초 시작 시 모든 테이블을 자동으로 생성합니다. 로그에서 초기화 성공 여부를 확인하세요.
 
+### Q: 로컬 ComfyUI(MiniMax-H3) 스토리보드에서 「서버에 연결할 수 없습니다」가 표시됩니다?
+
+A: 이 오류는 백엔드가 ComfyUI의 8193 포트에 접근하지 못한다는 뜻이며, 대부분 ComfyUI 프로세스가 이미 종료된 상태입니다. 가장 흔한 원인은 머신 메모리 고갈로 커널 OOM killer가 강제 종료한 경우입니다(로그에 `Out of memory: Killed process`). 먼저 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8193/` 와 `MemAvailable` 을 확인한 뒤 `start_gguf_tmux.sh` 로 시작하세요. 저장소에는 `watchdog_gguf.sh`(cron 3분 주기, 메모리 하한·기동 유예·연속 실패 억제 포함)가 포함되어 자동 복구에 사용할 수 있습니다. 자세한 내용은 [docs/comfyui-oom-watchdog.md](docs/comfyui-oom-watchdog.md) 를 참고하세요.
+
+> 주의: ComfyUI의 `/history` 는 프로세스 메모리에만 존재하며 재시작 시 사라지므로, 중단 시점에 진행 중이던 작업은 복구할 수 없고 다시 생성해야 합니다.
+
 ---
 
 ## 📋 업데이트 로그

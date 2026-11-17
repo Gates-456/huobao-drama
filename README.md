@@ -653,6 +653,14 @@ A: Check that the backend is running and the port is correct. In dev mode the pr
 A: 后端会在首次启动时自动创建所有表，检查日志确认初始化是否成功。<br>
 A: The backend creates all tables automatically on first launch — check the logs to confirm initialization succeeded.
 
+### Q: 本地 ComfyUI（MiniMax-H3）分镜报「无法连接服务器」？ / Q: Local ComfyUI (MiniMax-H3) storyboards report "cannot connect to server"?
+
+A: 该错误表示后端连不上 ComfyUI 的 8193 端口，通常是 ComfyUI 进程已退出——最常见原因是整机内存被占满后被内核 OOM killer 杀掉（日志可见 `Out of memory: Killed process`）。先确认 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8193/` 与 `MemAvailable`，再用 `start_gguf_tmux.sh` 拉起。仓库提供 `watchdog_gguf.sh`（cron 每 3 分钟、内存门槛 + 重启宽限 + 连续失败抑制）用于自动拉起，详见 [docs/comfyui-oom-watchdog.md](docs/comfyui-oom-watchdog.md)。<br>
+A: That error means the backend cannot reach ComfyUI on port 8193, which usually means the ComfyUI process is gone — most often killed by the kernel OOM killer after the machine ran out of memory (look for `Out of memory: Killed process` in the logs). Check `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8193/` and `MemAvailable`, then start it with `start_gguf_tmux.sh`. The repo ships `watchdog_gguf.sh` (cron every 3 minutes, with a memory gate, restart grace period, and consecutive-failure suppression) for automatic recovery — see [docs/comfyui-oom-watchdog.md](docs/comfyui-oom-watchdog.md).
+
+> 注意：ComfyUI 的 `/history` 只存在内存中，服务重启即清空，中断期间在途的任务无法恢复，只能重新生成。<br>
+> Note: ComfyUI's `/history` lives only in process memory and is cleared on restart, so in-flight tasks cannot be recovered and must be regenerated.
+
 ---
 
 ## 📋 更新日志 / Changelog

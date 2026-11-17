@@ -501,6 +501,12 @@ A: Check that the backend is running and the port is correct. In dev mode the pr
 
 A: The backend creates all tables automatically on first launch — check the logs to confirm initialization succeeded.
 
+### Q: Local ComfyUI (MiniMax-H3) storyboards report "cannot connect to server"?
+
+A: That error means the backend cannot reach ComfyUI on port 8193, which usually means the ComfyUI process is gone — most often killed by the kernel OOM killer after the machine ran out of memory (look for `Out of memory: Killed process` in the logs). Check `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8193/` and `MemAvailable`, then start it with `start_gguf_tmux.sh`. The repo ships `watchdog_gguf.sh` (cron every 3 minutes, with a memory gate, restart grace period, and consecutive-failure suppression) for automatic recovery — see [docs/comfyui-oom-watchdog.md](docs/comfyui-oom-watchdog.md).
+
+> Note: ComfyUI's `/history` lives only in process memory and is cleared on restart, so in-flight tasks cannot be recovered and must be regenerated.
+
 ---
 
 ## 📋 Changelog

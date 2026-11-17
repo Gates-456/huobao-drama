@@ -500,6 +500,12 @@ A: 检查后端是否启动，端口是否正确。开发模式下前端代理�
 
 A: 后端会在首次启动时自动创建所有表，检查日志确认初始化是否成功。
 
+### Q: 本地 ComfyUI（MiniMax-H3）分镜报「无法连接服务器」？
+
+A: 该错误表示后端连不上 ComfyUI 的 8193 端口，通常是 ComfyUI 进程已退出——最常见原因是整机内存被占满后被内核 OOM killer 杀掉（日志可见 `Out of memory: Killed process`）。先确认 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8193/` 与 `MemAvailable`，再用 `start_gguf_tmux.sh` 拉起。仓库提供 `watchdog_gguf.sh`（cron 每 3 分钟、内存门槛 + 重启宽限 + 连续失败抑制）用于自动拉起，详见 [docs/comfyui-oom-watchdog.md](docs/comfyui-oom-watchdog.md)。
+
+> 注意：ComfyUI 的 `/history` 只存在内存中，服务重启即清空，中断期间在途的任务无法恢复，只能重新生成。
+
 ---
 
 ## 📋 更新日志
