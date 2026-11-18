@@ -42,6 +42,27 @@ ComfyUI 的 `/history` 只存在进程内存里，重启后即清空。因此中
 
 > 该批历史数据由业务侧核对产出后处理；本文只记录机制与恢复手段，不做数据订正。
 
+### 二次故障：僵尸任务把「批量生成」堵死
+
+2026-11-18 重启后暴露了上面这条影响的另一面。剧集 3 有 18 个镜头没有成片，但各自挂着一条 11-16 遗留的 `processing` 任务（上游记录早已丢失），于是：
+
+1. 任务列表接口把这些镜头的状态算成「生成中」→ 前端 `isPendingVideo()` 为真；
+2. 「批量生成」的候选池先取「没有成片的镜头」，再过滤掉「生成中」的，池子被清空；
+3. 点击后只弹一句「没有可生成的镜头」，用户既无法生成也无法恢复。
+
+根因是**轮询不会对「上游已丢」下结论**：`/history/{id}` 返回 `{}` 时一律按 `processing` 处理，一直空转到 12h 上限。修复分两处：
+
+| 位置 | 改动 |
+| --- | --- |
+| `adapters/comfyui-video.ts` | 新增 `isTaskLost()`：`/history/{id}` 为空 **且** 该 prompt 不在 `/queue` 的 running/pending 中 → 判定上游已丢；任一请求异常都返回 false，交给下一轮 |
+| `services/generation.ts` | 轮询侧连续 6 轮（约 1 分钟）history 为空才探测；确认丢失即落 `failed / upstream_lost`，不再等 12h。`recoverVideoTask` 对 `upstream_lost` 直接拒绝恢复 |
+| 前端 `episode.vue` | `canRecoverVideo()` 排除 `upstream_lost`（不再显示必然失败的「恢复」按钮，只留「重新生成」）；批量生成已在确认弹窗统一确认过，`silent` 调用不再逐镜弹 `confirm` |
+
+判定为什么必须带 `/queue` 这一半：任务提交后、开始执行前，`/history` 本来就是空的，此时它一定在队列里。只凭「history 为空」会误杀正常排队的镜头。
+
+线上效果（同一批 18 条）：重启后端后约 1 分钟，全部自动落为 `failed / upstream_lost`，剧集 3 的「批量生成」恢复可用，无需手工改库。
+
+
 ## 恢复步骤
 
 ```bash
@@ -119,6 +140,7 @@ crontab 每 3 分钟执行一次：
 ## 注意事项
 
 - **ComfyUI 的 `/history` 不持久化**：服务重启即丢，中断期间的在途任务无法恢复。要降低损失，只能减少中断概率（内存门槛 + 与批处理作业错峰）。
+- **僵尸任务会自我了结**：`upstream_lost` 检测在重启后约 1 分钟内把这类记录落成 `failed`，因此不会再出现「批量生成提示没有可生成的镜头、手工改库才能继续」的情况。若发现任务长期停在 `processing` 超过 2 分钟且 ComfyUI 队列为空，先查 `server_runtime.log` 与后端 `poll-request` 日志。
 - **与批处理作业共存**：ComfyUI 常驻约 32GB RSS（模型 offload 到内存）。同机跑 `--workers 20` 级别的视频批处理会直接打爆 62GB 总量。跑批时应限制并发，或等 ComfyUI 空闲窗口。
 - **GPU 侧通常不是瓶颈**：双 V100 在空闲时各占 8MiB，ComfyUI 被 OOM 杀掉后显存会自动释放。
 - 修改 `start_gguf.sh` 里的 GPU 预检会直接影响能否启动（它会在 V100 不在 `cuda:0/1` 时主动中止），排障时先看 `server_runtime.log` 开头的 `[gpu-check]` 段。

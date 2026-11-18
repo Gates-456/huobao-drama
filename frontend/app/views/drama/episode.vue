@@ -1992,7 +1992,10 @@ function latestVideoTask(id) {
 const recoverableVideoCount = computed(() => sbs.value.filter(sb => canRecoverVideo(sb.id)).length)
 function canRecoverVideo(id) {
   const task = latestVideoTask(id)
-  return !!task && task.status === 'failed' && task.error_code !== 'generation_failed'
+  // generation_failed = 上游明确失败；upstream_lost = 上游记录已丢（ComfyUI 重启后 history 清空）
+  // 两者都没有可恢复的上游任务，只提示重新生成，避免恢复按钮点了必然失败
+  return !!task && task.status === 'failed'
+    && task.error_code !== 'generation_failed' && task.error_code !== 'upstream_lost'
     && !!(task.task_id || task.result_url)
 }
 function videoAwaitingDelivery(sb) {
@@ -3376,7 +3379,8 @@ async function genVid(sb, opts = {}) {
   if (!opts.forceNew && canRecoverVideo(sb.id)) return recoverVideo(sb)
   const latest = latestVideoTask(sb.id)
   const forceNew = opts.forceNew || latest?.status === 'failed'
-  if (forceNew && !window.confirm(t('episode.recovery.confirmNew'))) return
+  // 批量生成已经在确认弹窗里统一确认过（镜头数/总时长/模型），不再逐镜弹 confirm
+  if (forceNew && !opts.silent && !window.confirm(t('episode.recovery.confirmNew'))) return
   const referenceImages = getShotReferenceImages(sb)
   // 参考素材完全来自分镜绑定的角色/场景/道具图片
   const params = {

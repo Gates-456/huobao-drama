@@ -14,7 +14,7 @@ import { now } from '../utils/response.js'
 import { downloadFile, fetchImageAsCompressedDataUrl, generateImageThumb, readImageAsCompressedDataUrl, readImageAsDataUrl, saveBase64Image } from '../utils/storage.js'
 import { extractVideoPoster } from '../utils/video-poster.js'
 import { getImageAdapter, getVideoAdapter } from './adapters/registry'
-import type { AIConfig } from './adapters/types'
+import type { AIConfig, VideoProviderAdapter } from './adapters/types'
 import { logTaskError, logTaskPayload, logTaskProgress, logTaskStart, logTaskSuccess, logTaskWarn, redactUrl } from '../utils/task-logger.js'
 
 type TaskType = 'image' | 'video'
@@ -403,7 +403,12 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
   const label = taskLabel(type)
   const profile = POLL_PROFILES[type]
   const adapter = type === 'image' ? getImageAdapter(config.provider) : getVideoAdapter(config.provider)
+  const lostProbe = type === 'video'
+    ? (adapter as VideoProviderAdapter).isTaskLost?.bind(adapter)
+    : undefined
   const startedAt = Date.now()
+  // 上游 history 连续为空且不在队列的次数（约 6 轮 ≈ 1 分钟）→ 判定记录已丢失
+  let historyMisses = 0
 
   for (let i = 0; i < profile.attempts; i++) {
     if (profile.maxDurationMs && Date.now() - startedAt >= profile.maxDurationMs) {
@@ -436,6 +441,22 @@ async function pollTask(record: SysTaskRecord, config: AIConfig, taskId: string)
       const pollResp: any = adapter.parsePollResponse(result)
       if (type === 'video' && pollResp.stage === 'transferring') {
         await db.update(schema.sysTask).set({ stage: 'transferring', updatedAt: now() }).where(eq(schema.sysTask.id, record.id))
+      }
+
+      // ComfyUI 的 /history 不持久化：服务重启后，在途任务既没有历史也不在队列，
+      // 继续轮询只会空转到 12h 上限并把记录留成 processing —— 前端据此把这些镜头
+      // 判为「生成中」，批量生成于是提示「没有可生成的镜头」。连续 6 轮（约 1 分钟）
+      // history 为空且确认不在队列时直接落 failed，让用户能重新生成。
+      if (type === 'video' && lostProbe && result && typeof result === 'object'
+        && Object.keys(result).length === 0) {
+        historyMisses++
+        if (historyMisses >= 6 && await lostProbe(config, taskId)) {
+          await failTask(record.id, 'ComfyUI 已重启，该任务的上游记录已丢失，无法恢复，请重新生成',
+            'upstream_lost')
+          return
+        }
+      } else {
+        historyMisses = 0
       }
 
       if (pollResp.status === 'completed') {
@@ -575,6 +596,7 @@ export async function recoverVideoTask(id: number): Promise<void> {
   if (activeTasks.has(id) || record.status === 'completed') return
   if (!record.resultUrl && !record.taskId) throw new Error('未保存上游任务编号，请先核对上游记录，勿重复生成')
   if (record.errorCode === 'generation_failed') throw new Error('上游已确认生成失败，无法恢复原任务')
+  if (record.errorCode === 'upstream_lost') throw new Error('上游记录已丢失（ComfyUI 重启），无法恢复原任务，请重新生成')
   // 在任何异步配置读取前获取锁，重复点击不会启动多个下载。
   activeTasks.add(id)
   try {

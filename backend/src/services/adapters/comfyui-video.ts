@@ -416,4 +416,25 @@ export class ComfyUIVideoAdapter implements VideoProviderAdapter {
     }
     return null
   }
+
+  /**
+   * ComfyUI 的 /history 只保存在进程内存里，服务重启即清空（`/history/{id}` 返回 `{}`）。
+   * 此时在途任务既没有历史也没有队列记录，继续轮询永远拿不到结果。
+   * 判据：history 为空 **且** 该 prompt 不在 /queue 的 running/pending 里 → 上游已丢。
+   * 任一请求异常都不下结论，交由下一轮轮询重试（避免把网络抖动误判成丢失）。
+   */
+  async isTaskLost(config: AIConfig, taskId: string): Promise<boolean> {
+    const base = (config.baseUrl || '').replace(/\/+$/, '')
+    if (!base) return false
+    const [history, queue] = await Promise.all([
+      fetch(`${base}/history/${encodeURIComponent(taskId)}`, { signal: AbortSignal.timeout(8000) })
+        .then(resp => (resp.ok ? resp.json() : null)),
+      fetch(`${base}/queue`, { signal: AbortSignal.timeout(8000) })
+        .then(resp => (resp.ok ? resp.json() : null)),
+    ]).catch(() => [null, null] as const)
+    if (!history || !queue) return false
+    if (Object.keys(history).length > 0) return false
+    const items = [...(queue.queue_running || []), ...(queue.queue_pending || [])]
+    return !items.some((item: any) => Array.isArray(item) && item[1] === taskId)
+  }
 }

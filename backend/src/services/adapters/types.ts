@@ -57,6 +57,12 @@ export interface VideoProviderAdapter {
   parsePollResponse(result: any): VideoPollResponse
 
   extractVideoUrl(result: any): string | null
+
+  /**
+   * 判定「上游记录已丢失」：轮询返回空、且任务已不在上游队列中。
+   * 仅对 history 不持久化的上游（ComfyUI）有意义；未实现的适配器视为不可判定。
+   */
+  isTaskLost?(config: AIConfig, taskId: string): Promise<boolean>
 }
 
 // ============ 通用类型 ============
