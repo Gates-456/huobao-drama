@@ -16,6 +16,97 @@ ComfyUI 工作目录 `/mnt/sda/vlm/minimax-h3-gguf-q8-opt-20260915`，`ComfyUI/`
 - `watchdog_gguf.sh` — 2026-11-16 新增的看护脚本（见下）。
 - `outputs/` — 生成产物；`comfyui_gguf.db` — ComfyUI 自身资产库。
 
+## 显存预算与参考图上限
+
+### 8 GiB 并不等于 8 GiB 可用
+
+GPU 规格写 8192 MiB，但 CUDA 报出的可用容量是 **7.66 GiB ≈ 7844 MiB**，差的约 348 MiB 被 CUDA 上下文与驱动占掉，应用完全拿不到。OOM 报错里的每个数字都是同一时刻的账本，可以直接对账（2026-11-18 案例）：
+
+| 项目 | 数值 |
+| --- | --- |
+| 卡标称 | 8192 MiB（8.00 GiB） |
+| CUDA 可用容量 | 7.66 GiB（7844 MiB） |
+| PyTorch **已分配** | 6.82 GiB（6984 MiB） |
+| PyTorch 已预留未使用（碎片） | 143 MiB |
+| 非 PyTorch 占用（CUDA context 等） | 195 MiB |
+| **实际空闲** | **449.62 MiB** |
+| 本次申请 | **500 MiB** |
+| 缺口 | **50.38 MiB** |
+
+所以「6G 多为什么还会炸」不是矛盾：`6.82 GiB allocated` 表示**已经用掉**的量，不是可用量。真实余量 = 7.66 − 6.82 − 0.14（碎片）− 0.19（非 PyTorch）≈ 0.44 GiB。而 PyTorch 要的是**连续**的 500 MiB，那 143 MiB 碎片拼不出来，`expandable_segments:True` 也救不了。
+
+### 瓶颈在放 CLIP 的那块 8GB 卡
+
+工作流把三类模型分到不同卡（`CUDA_VISIBLE_DEVICES=4,5,3,2,1,0` 下的 logical 编号）：
+
+| logical | 物理卡 | 承载 | 典型占用 |
+| --- | --- | --- | --- |
+| `cuda:0` / `cuda:1` | 双 V100-16GB | 主模型 50 blocks 对半拆 | 8.0 GB / 7.1 GB |
+| `cuda:2` | RTX 3070 8GB | **Qwen3VL 32B 文本编码器** | 6.0 GB（lowvram 满装） |
+| `cuda:3` | RTX 3060 Ti 8GB | 视频 VAE | 4.97 GB |
+
+32B 编码器权重约 26 GB，lowvram 按「当前空闲减 819 MiB 余量」的策略把 6042–6092 MiB 塞进 8GB 卡，**留给编码阶段激活的只剩 342–449 MiB**。参考图会变成图像 token 送进同一个编码器，图越多激活越高，于是踩线。
+
+### 参考图张数与 OOM 的关系
+
+全量历史（`sys_task.params.referenceImageUrls` × 报错文本 `out of memory`）：
+
+| 参考图 | CUDA OOM | 任务数 | 说明 |
+| --- | --- | --- | --- |
+| 0–2 张 | 0 | 646 | 稳定 |
+| 3 张 | 7 | 218 | 偶发（3.2%） |
+| 4 张 | 5 | 36 | 明显变差（14%） |
+| 5 张 | 7 | 8 | 基本必炸（87.5%） |
+| 8 张 | 0 | 1 | 该次失败另有原因 |
+
+**这不是「参考图多了就用不成」**：3 张成功 106 次、4 张成功 14 次，都能跑通，只是失败概率随张数上升——余量越薄，编码阶段的峰值越容易越界。真正的实际门槛在 **5 张以上**。
+
+### `--reserve-vram 0.8` 的作用与代价
+
+修复方式是在 `start_gguf.sh` 里加 `--reserve-vram 0.8`：让 ComfyUI 在每张卡上主动少装约 800 MiB 权重（`EXTRA_RESERVED_VRAM` 会进 `minimum_inference_memory()`，进而压低 lowvram 的装载上限）。
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| lowvram 自估可用 | 6388 MB | 6015 MB |
+| CLIP 实际装上卡 | 6092 MB | **5652 MB** |
+| 留给编码 | 449 MB（要 500 → OOM） | 约 720 MB（够） |
+
+代价仅吞吐：CPU 侧多卸载约 420 MB，实测 step 从约 50 s/it 升到 70–96 s/it。**数值路径完全不变**——`steps=8`、`sigmas=[1.0, 0.9882, 0.973, 0.9524, 0.9231, 0.878, 0.8, 0.6316, 0.0]`、LoRA `strength=1.0` merge、`split 50 blocks = cuda:0:25 / cuda:1:25`、`lowvram patches: 0`、`audio_denoise 0.15`、`strict_prompt_tags: true` 全部与修复前一致，因此不影响此前修复的台词/禁项/空镜吟诵等提示词层缺陷（那一层改的是 prompt 文本与发送字段，不涉显存）。
+
+### 关于「软限制」
+
+代码侧**没有**新增任何参考图数量限制。上限仍由两处既有逻辑决定：
+
+- 前端 `refImageLimit`：Wan 3.0 为 10，其余模型为 9（`getShotReferenceImages` 按「场景 → 角色 → 道具」顺序取，去重并截断）；
+- 硬件余量：当前配置下 4 张以内基本稳定，5 张以上风险显著。
+
+若要提高天花板，可选方向（均未实施）：
+
+1. 把 CLIP 拆到两张 8GB 卡（见下节，需要改代码）；
+2. 降低编码器精度或换更小的文本编码器；
+3. 在镜头绑定层限制素材数量（例如场景 1 + 角色 2 封顶），从源头控制参考图张数。
+
+> ⚠️ **V100 不能承载 CLIP**：`fix_cuda_smem.py` 顶部注明 int8/convrot 的 CUDA kernel 只编到 sm86+（3070/3060Ti），V100 是 sm70，跑起来会 `no kernel image`；而 eager 后端对这个 32B 编码器数值不可用（BOS 隐藏态爆到 ~15400，DiT 直接忽略提示词，输出糊成一片）。所以「把 CLIP 挪到 16GB V100」这条路走不通，能加显存的只有另外两张空闲的 8GB sm86 卡。
+
+### CLIP 能否拆到两张 8GB 卡
+
+**现状：直接配置做不到。** 两点约束：
+
+- ComfyUI 的 `ModelPatcher` 只有单个 `load_device`（`comfy/model_patcher.py:357`），lowvram 的「装载一部分 + 其余逐层从 CPU 流式搬运」是**单卡**内的一次装载决策；
+- 本仓库的 `MiniMaxH3ModelParallel` 对 CLIP 也只做 `clip.patcher.load_device = cdev`（`minimax_model_parallel.py:512`），`clip_device` 解析出来就是一个 `torch.device`；
+- 自带的 `ComfyUI-MultiGPU/CLIPLoaderMultiGPU` 同样只接受**一个** `cuda:N`，且其 `type` 列表只有 `stable_diffusion / stable_cascade / sd3 / stable_audio`，不含 `minimax`，对 H3 这条链不可用。
+
+**规模参考**（日志实测）：CLIP 权重总量约 **25.3 GB**（`5390 MB loaded + 20493 MB offloaded`），单张 8GB 卡最多常驻约 5.4–5.7 GB，其余约 20 GB 每帧编码都从 CPU 逐层搬 —— 这也是编码慢、且激活余量被压到 450 MB 的原因。
+
+**要做到需要改代码**，可行路径是照搬 DiT 已经验证的做法（`MiniMaxH3ModelParallel` 把 50 个 block 分给两张 V100，forward 时按 block 搬 hidden states）：
+
+1. 在自定义节点里把 CLIP 的 transformer layers 按层切成两段，分别 `.to()` 到两张 sm86 的 8GB 卡（当前空闲的是逻辑 `cuda:4` = 物理1 RTX 3070、逻辑 `cuda:5` = 物理0 3060Ti）；
+2. 包一层 forward，在两段交界处把 hidden states / attention mask 搬到下一张卡；
+3. int8/convrot 的 backend 覆盖（`fix_cuda_smem.py` 的 `_cuda_clip_ctx`）需要按层判断设备，而不是只看 `patcher.load_device` 的 capability。
+
+收益：两张卡各常驻约 5.4 GB → 常驻权重翻倍到 ~10.8 GB，CPU 流式量从 20 GB 降到 ~14.5 GB，单卡激活余量明显变宽，参考图张数的天花板随之抬高。
+代价：属于自研改动，需要处理量化权重跨卡搬运与显存碎片，并有回归风险；**目前尚未实施**，现有稳定方案仍是 `--reserve-vram 0.8` + 控制参考图张数。
+
 ## 2026-11-16 中断事故
 
 ### 现象
@@ -143,4 +234,5 @@ crontab 每 3 分钟执行一次：
 - **僵尸任务会自我了结**：`upstream_lost` 检测在重启后约 1 分钟内把这类记录落成 `failed`，因此不会再出现「批量生成提示没有可生成的镜头、手工改库才能继续」的情况。若发现任务长期停在 `processing` 超过 2 分钟且 ComfyUI 队列为空，先查 `server_runtime.log` 与后端 `poll-request` 日志。
 - **与批处理作业共存**：ComfyUI 常驻约 32GB RSS（模型 offload 到内存）。同机跑 `--workers 20` 级别的视频批处理会直接打爆 62GB 总量。跑批时应限制并发，或等 ComfyUI 空闲窗口。
 - **GPU 侧通常不是瓶颈**：双 V100 在空闲时各占 8MiB，ComfyUI 被 OOM 杀掉后显存会自动释放。
+- **CLIP 卡是唯一显存瓶颈**：`cuda:2` 那块 8GB 卡常年贴顶（实测 7375/8192 MiB used，剩余 466 MiB 长时间不动），参考图 5 张以上极易 OOM。判据与预算明细见上文「显存预算与参考图上限」。
 - 修改 `start_gguf.sh` 里的 GPU 预检会直接影响能否启动（它会在 V100 不在 `cuda:0/1` 时主动中止），排障时先看 `server_runtime.log` 开头的 `[gpu-check]` 段。
